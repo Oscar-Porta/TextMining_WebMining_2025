@@ -1,0 +1,962 @@
+---
+title: |
+  <b><div style="text-align: center"> Text Mining — Cuenta de X del Museo del Prado </div></b>
+author:  
+  name: Óscar Porta
+date: Agosto 2025
+output: 
+  rmdformats::readthedown:
+    code_folding: hide
+css: customOPS_tm.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.align = "center",
+  fig.width = 12,
+  fig.height = 5,
+  out.width = "100%",
+  out.height = "80%"
+)
+```
+
+En este informe realizaremos un análisis lingüístico y de text mining sobre los tuits publicados por la cuenta del Museo del Prado entre 01-03-2024 y 30-06-2025 (dataset prado del fichero evaluacion.RData).
+El flujo incluirá: limpieza del texto preservando el punto para segmentación, anotación lingüística con udpipe (tokens, UPOS, lemas, dependencias), cálculo de términos más frecuentes, palabras clave mediante RAKE, PMI/colocaciones y frases nominales, extracción con TextRank, coocurrencias y correlaciones (incluyendo nombres propios cuando aporte valor), una exploración temática (pintores y exposiciones) y dos focos específicos (“Santo Domingo” y “Veronese”).
+
+Finalmente, generaremos word embeddings con GloVe (corpus de lemas filtrado a NOUN/ADJ/PROPN), evaluaremos términos similares (“greco”, “ecce”, “tríptico”, “falomir”) y visualizaremos el espacio semántico con UMAP.
+
+# **1.Librerías utilizadas**
+
+Usaremos un conjunto de paquetes que cubren el flujo completo:
+
+	•	tidyverse: manipulación de datos y gráficos (dplyr, ggplot2, readr).
+	
+	•	lubridate: manejo de fechas (filtrado por rango temporal).
+	
+	•	stringr: utilidades de cadenas para apoyar la limpieza.
+	
+	•	janitor / skimr: chequeos y resúmenes exploratorios.
+	
+	•	reactable: tablas interactivas en el informe HTML.
+	
+	•	udpipe: análisis lingüístico (tokenización, UPOS, lemas, dependencias) y utilidades (frecuencias, DTM, coocurrencias).
+	
+	•	textrank: TextRank para extracción de keywords.
+	
+	•	widyr: correlaciones de términos a partir de DTM.
+	
+	•	igraph / ggraph: redes de coocurrencias y visualización.
+	
+	•	text2vec / Matrix: GloVe (embeddings) y manejo disperso.
+	
+	•	uwot: UMAP para reducción de dimensionalidad y visualización.
+	
+	•	rmdformats: plantilla readthedown para HTML con navegación lateral.
+	
+
+```{r carga_librerias_tm, message=FALSE, warning=FALSE}
+instalar_si_falta <- function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+    library(pkg, character.only = TRUE)
+  }
+}
+
+paquetes <- c(
+  "tidyverse","lubridate","stringr","janitor","skimr","reactable",
+  "udpipe","textrank","widyr","igraph","ggraph",
+  "text2vec","Matrix","uwot","rmdformats"
+)
+
+invisible(lapply(paquetes, instalar_si_falta))
+```
+## 1.1 Carga y exploración de  datos
+
+```{r carga_y_vista_prado, message=FALSE, warning=FALSE}
+# === 1) Carga y comprobaciones básicas ===
+load("evaluacion.RData")  # Carga: prado, reviews, documentos
+cat("Objetos cargados:", paste(ls(), collapse = ", "), "\n")
+
+# Chequeo rápido del dataset 'prado'
+dim(prado)       # nº filas x columnas
+str(prado)       # estructura
+head(prado, 5)   # primeras filas
+summary(prado)   # resumen columnas
+if ("skimr" %in% rownames(installed.packages())) skimr::skim(prado)
+
+# === 2) Vista interactiva inicial con reactable ===
+
+# Copia segura
+prado_vista <- prado
+
+# Parseo de fecha a Date si fuera necesario
+if (!inherits(prado_vista$fecha, "Date")) {
+  prado_vista$fecha <- suppressWarnings(lubridate::as_date(prado_vista$fecha))
+}
+
+# Función para truncar texto en la vista
+.trunc_txt <- function(x, n = 180) {
+  x <- as.character(x)
+  too_long <- nchar(x, allowNA = TRUE) > n
+  x[too_long] <- paste0(substr(x[too_long], 1, n - 1), "…")
+  x
+}
+
+# Data para la tabla (dejamos el texto completo en prado_vista para usarlo en "details")
+tabla_prado <- dplyr::transmute(
+  prado_vista,
+  fecha,
+  texto_corto = .trunc_txt(texto, 180),
+  url
+)
+tabla_prado <- dplyr::arrange(tabla_prado, dplyr::desc(fecha))
+
+# Tabla interactiva:
+reactable::reactable(
+  data = tabla_prado,
+  searchable = TRUE,
+  filterable = TRUE,
+  pagination = FALSE,             # scroll continuo
+  height = 520,
+  defaultSorted = "fecha",
+  defaultSortOrder = "desc",
+  resizable = TRUE,               # columnas redimensionables
+  defaultColDef = reactable::colDef(
+    align = "left",
+    headerClass = "header-bold",
+    style = list(whiteSpace = "normal")  # permitir salto de línea
+  ),
+  columns = list(
+    fecha = reactable::colDef(
+      name = "Fecha",
+      minWidth = 120,
+      format = reactable::colFormat(date = TRUE)
+    ),
+    texto_corto = reactable::colDef(
+      name = "Texto (truncado)",
+      minWidth = 520
+    ),
+    url = reactable::colDef(
+      name = "Enlace",
+      minWidth = 120,
+      html = TRUE,
+      cell = function(value) {
+        if (is.na(value) || value == "") return("")
+        htmltools::tags$a(href = value, target = "_blank", "Abrir")
+      }
+    )
+  ),
+  details = function(index) {
+    txt_full <- prado_vista$texto[index]
+    htmltools::div(
+      style = "padding: 12px; background: #fafafa; border-top: 1px solid #eee;",
+      htmltools::tags$b("Texto completo:"),
+      htmltools::tags$p(txt_full, style = "margin: 6px 0 0 0;")
+    )
+  },
+  theme = reactable::reactableTheme(
+    headerStyle = list(fontWeight = 600),
+    borderColor = "#eee",
+    cellPadding = "8px 10px"
+  )
+)
+```
+
+# **2. Filtrado temporal**
+
+En este paso filtramos los tuits a la ventana temporal del enunciado (01-03-2024 a 30-06-2025) y validamos el resultado con un recuento mensual. Esto nos asegura que trabajamos exactamente con el subconjunto requerido y nos da una primera visión de la actividad por meses.
+
+```{r filtrado_temporal_y_resumen_mensual, message=FALSE, warning=FALSE}
+# --- Filtrado temporal: 01-03-2024 a 30-06-2025 ---
+
+# Aseguramos tipo Date
+prado <- prado %>%
+  mutate(fecha = lubridate::as_date(fecha))
+
+# Ventana temporal del enunciado
+fecha_ini <- lubridate::ymd("2024-03-01")
+fecha_fin <- lubridate::ymd("2025-06-30")
+
+prado_filtrado <- prado %>%
+  filter(fecha >= fecha_ini, fecha <= fecha_fin)
+
+# Comprobación rápida
+cat("Registros totales en prado:", nrow(prado), "\n")
+cat("Registros tras filtrar (", as.character(fecha_ini), " a ", as.character(fecha_fin), "): ", 
+    nrow(prado_filtrado), "\n", sep = "")
+
+# --- Resumen mensual (nº de tuits por mes) ---
+prado_mes <- prado_filtrado %>%
+  mutate(mes = floor_date(fecha, unit = "month")) %>%
+  count(mes, name = "n_tuits") %>%
+  arrange(mes)
+
+# Tabla interactiva con reactable
+reactable::reactable(
+  prado_mes,
+  searchable = TRUE,
+  pagination = FALSE,
+  height = 360,
+  defaultSorted = "mes",
+  defaultSortOrder = "asc",
+  defaultColDef = reactable::colDef(align = "left"),
+  columns = list(
+    mes = reactable::colDef(name = "Mes", format = reactable::colFormat(date = TRUE), minWidth = 140),
+    n_tuits = reactable::colDef(name = "Nº de tuits", minWidth = 120)
+  ),
+  theme = reactable::reactableTheme(
+    headerStyle = list(fontWeight = 600),
+    borderColor = "#eee",
+    cellPadding = "8px 10px",
+    stripedColor = "#fafafa"
+  )
+)
+
+# Vista breve de los tuits filtrados para validar contenido
+.trunc_txt <- function(x, n = 160) {
+  x <- as.character(x)
+  too_long <- nchar(x, allowNA = TRUE) > n
+  x[too_long] <- paste0(substr(x[too_long], 1, n - 1), "…")
+  x
+}
+
+tabla_check <- prado_filtrado %>%
+  transmute(
+    fecha,
+    texto_corto = .trunc_txt(texto, 160),
+    url
+  ) %>%
+  arrange(desc(fecha)) %>%
+  head(50)
+
+reactable::reactable(
+  tabla_check,
+  searchable = TRUE,
+  pagination = TRUE,
+  defaultPageSize = 10,
+  defaultSorted = "fecha",
+  defaultSortOrder = "desc",
+  columns = list(
+    fecha = reactable::colDef(name = "Fecha", format = reactable::colFormat(date = TRUE), minWidth = 120),
+    texto_corto = reactable::colDef(name = "Texto (truncado)", minWidth = 520),
+    url = reactable::colDef(
+      name = "Enlace",
+      minWidth = 120,
+      html = TRUE,
+      cell = function(value) {
+        if (is.na(value) || value == "") return("")
+        htmltools::tags$a(href = value, target = "_blank", "Abrir")
+      }
+    )
+  )
+)
+```
+
+# **3. Limpieza de texto**
+
+En este paso realizamos un proceso de **depuración del contenido textual** de los tuits.  
+El objetivo es eliminar elementos que no aportan valor semántico al análisis y que podrían distorsionar los resultados posteriores (por ejemplo, menciones a usuarios, hashtags o URLs).  
+
+Para ello creamos una nueva columna llamada `textmining`, a partir del texto original, sobre la cual aplicamos las siguientes transformaciones:
+
+- Eliminación de menciones a usuarios de X (@usuario).  
+- Eliminación de hashtags (#hashtag).  
+- Eliminación de URLs y direcciones de correo electrónico.  
+- Inserción de espacios en los casos en los que la puntuación va seguida de letras sin separación.  
+- Conservación únicamente de letras, dígitos, espacios y signos de puntuación relevantes.  
+- Normalización de espacios en blanco (reducción de espacios múltiples y eliminación de los espacios al inicio y al final).  
+
+De este modo obtenemos una versión **limpia y homogénea del texto** que nos servirá como base para el análisis lingüístico posterior (tokenización, lematización y extracción de palabras clave).
+
+
+```{r limpieza_texto, message=FALSE, warning=FALSE}
+# === 3) Limpieza de texto en 'prado_filtrado' ===
+# Creamos 'textmining' a partir de 'texto' y aplicamos las reglas del enunciado.
+
+prado_filtrado$textmining <- prado_filtrado$texto
+prado_filtrado$textmining <- gsub("@\\w+", "", prado_filtrado$textmining)                     # menciones
+prado_filtrado$textmining <- gsub("#\\w+", "", prado_filtrado$textmining)                     # hashtags
+prado_filtrado$textmining <- gsub("http[^[:blank:]]*", "", prado_filtrado$textmining)         # URLs
+prado_filtrado$textmining <- gsub("\\w+@\\w+\\.\\w+", "", prado_filtrado$textmining)          # e-mails
+prado_filtrado$textmining <- gsub("([.]|,|;|:)([[:alpha:]])", "\\1 \\2", prado_filtrado$textmining) # espacio tras puntuación
+prado_filtrado$textmining <- gsub("[^[:alpha:][:digit:][:space:][:punct:]]*", "", prado_filtrado$textmining) # caracteres raros
+prado_filtrado$textmining <- gsub("\\s{2,}", " ", prado_filtrado$textmining)                  # espacios múltiples
+prado_filtrado$textmining <- trimws(prado_filtrado$textmining)                                # bordes
+
+# Vista rápida (original vs limpio)
+reactable::reactable(
+  prado_filtrado |>
+    dplyr::select(fecha, texto, textmining) |>
+    head(15),
+  searchable = TRUE,
+  pagination = TRUE,
+  defaultPageSize = 5,
+  columns = list(
+    fecha = reactable::colDef(name = "Fecha"),
+    texto = reactable::colDef(name = "Texto original", minWidth = 420),
+    textmining = reactable::colDef(name = "Texto limpio", minWidth = 420)
+  )
+)
+```
+# **4. Análisis lingüístico**
+
+Una vez limpio el texto de los tuits, realizamos un **análisis lingüístico** utilizando el paquete `udpipe`.  
+Este análisis nos permite descomponer el texto en **tokens** (palabras individuales), asignarles su **categoría gramatical** (sustantivo, adjetivo, verbo, nombre propio, etc.), obtener el **lema** de cada palabra y establecer las **relaciones de dependencia sintáctica** entre ellas.  
+
+Estos procesos son fundamentales porque nos permiten:  
+- Trabajar con la **forma canónica de las palabras** (lemas).  
+- Filtrar únicamente las categorías de interés (sustantivos, adjetivos, nombres propios).  
+- Analizar el texto a un nivel más estructurado y semánticamente significativo.  
+
+El resultado será un **dataframe enriquecido**, en el que cada fila corresponde a un token con sus anotaciones lingüísticas.
+
+```{r modelo_udpipe, message=FALSE, warning=FALSE}
+# --- Modelo de idioma para udpipe (Español) ---
+
+# Descarga del modelo (solo la primera vez, luego comentamos esta línea)
+# udpipe_download_model(language = "spanish")
+
+# Carga del modelo ya descargado en el directorio de trabajo
+modelo <- udpipe_load_model("spanish-gsd-ud-2.5-191206.udpipe")
+
+# Confirmación
+print(modelo)
+```
+
+
+```{r anotacion_udpipe, message=FALSE, warning=FALSE}
+# --- 4.2 Anotación lingüística con udpipe (versión base) ---
+
+# Anotamos el texto limpio
+anotaciones <- udpipe_annotate(
+  object = modelo,
+  x      = prado_filtrado$textmining,
+  doc_id = as.character(prado_filtrado$url)
+)
+
+# Guardamos dos objetos por claridad:
+anotaciones_df_raw <- as.data.frame(anotaciones)  # copia cruda (referencia)
+anotaciones_df     <- anotaciones_df_raw          # objeto de trabajo SIN filtrar stopwords
+
+# Vista rápida
+reactable::reactable(
+  head(anotaciones_df, 50),
+  searchable = TRUE,
+  defaultPageSize = 10,
+  highlight = TRUE
+)
+```
+
+
+# **5. Términos más frecuentes**
+
+A partir de las anotaciones lingüísticas obtenidas con `udpipe`, seleccionamos las categorías gramaticales que resultan más relevantes para este análisis: **sustantivos (NOUN), adjetivos (ADJ) y nombres propios (PROPN)**.  
+El objetivo es identificar qué términos aparecen con mayor frecuencia en los tuits del Museo del Prado durante el periodo de estudio.  
+
+De esta forma, obtenemos una primera aproximación al vocabulario predominante, que nos servirá de base para posteriores análisis de palabras clave, coocurrencias y correlaciones.
+
+```{r terminos_frecuentes, message=FALSE, warning=FALSE}
+# --- 5) Términos más frecuentes (NOUN/ADJ/PROPN)---
+terminos <- subset(anotaciones_df, upos %in% c("NOUN", "ADJ", "PROPN"))
+
+# Aseguramos lemas en minúscula y sin NA
+lemmas <- tolower(terminos$lemma)
+lemmas <- lemmas[!is.na(lemmas) & nzchar(lemmas)]
+
+# Frecuencias (txt_freq devuelve key, freq, freq_pct)
+frecuencias <- txt_freq(lemmas)
+
+# Tabla interactiva (Top 50)
+reactable::reactable(
+  head(frecuencias, 50),
+  searchable = TRUE,
+  pagination = TRUE,
+  defaultPageSize = 10,
+  defaultSorted = "freq",
+  defaultSortOrder = "desc",
+  columns = list(
+    key = reactable::colDef(name = "Término"),
+    freq = reactable::colDef(name = "Frecuencia"),
+    freq_pct = reactable::colDef(
+      name = "Frecuencia (%)",
+      format = reactable::colFormat(percent = TRUE, digits = 2)
+    )
+  )
+)
+
+# Visualización básica (Top 20)
+frecuencias %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(key, freq), y = freq)) +
+  geom_col(fill = "#3AAFA9") +
+  coord_flip() +
+  labs(
+    title = "Top 20 términos más frecuentes",
+    x = "Término",
+    y = "Frecuencia"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+# **6. Palabras clave**
+
+En esta sección aplicamos diferentes métodos de extracción de **palabras clave** sobre los tuits del Museo del Prado. El objetivo es identificar términos o combinaciones de términos especialmente representativos del corpus, más allá de su mera frecuencia individual.
+
+Los métodos utilizados son los siguientes:
+
+- **RAKE (Rapid Automatic Keyword Extraction):** identifica palabras clave a partir de la frecuencia de aparición de términos y sus coocurrencias.  
+- **PMI (Pointwise Mutual Information) / colocaciones:** detecta combinaciones de palabras que ocurren juntas con mayor frecuencia de lo esperado.  
+- **Extracción de frases nominales:** obtiene secuencias de sustantivos y adjetivos que funcionan como unidades significativas (ej. *pintura flamenca*).  
+- **TextRank:** construye una red de palabras y aplica el algoritmo PageRank para identificar secuencias relevantes.
+
+Cada técnica aporta una perspectiva complementaria, enriqueciendo el análisis de las temáticas presentes en los tuits.
+
+```{r rake_keywords_base, message=FALSE, warning=FALSE}
+# --- 6.1) RAKE (versión base, sin exclusiones) ---
+
+# Usamos la anotación COMPLETA (sin filtrar lemas): anotaciones_df_raw
+# Si no existe cambia a 'anotaciones_df'
+x_base <- if (exists("anotaciones_df_raw")) anotaciones_df_raw else anotaciones_df
+
+# RAKE sobre lemas, agrupado por documento, con NOUN/ADJ/PROPN como relevantes
+kw_rake_base <- keywords_rake(
+  x        = x_base,
+  term     = "lemma",
+  group    = "doc_id",
+  relevant = x_base$upos %in% c("NOUN","ADJ","PROPN"),
+  n_min    = 2
+)
+
+# Ordenamos por score RAKE descendente y mostramos top 30
+kw_rake_base <- kw_rake_base[order(-kw_rake_base$rake), ]
+
+reactable::reactable(
+  head(kw_rake_base, 30),
+  searchable = TRUE,
+  pagination = TRUE,
+  defaultPageSize = 10,
+  defaultSorted = "rake",
+  defaultSortOrder = "desc"
+)
+```
+
+```{r pmi_colocaciones, message=FALSE, warning=FALSE}
+# --- PMI / Colocaciones con udpipe (sin argumento 'measure') ---
+
+# 1) Filtramos categorías relevantes (NOUN, ADJ, PROPN)
+terms_relev <- subset(
+  anotaciones_df,
+  upos %in% c("NOUN", "ADJ", "PROPN")
+)
+
+# 2) Colocaciones: mínimo de coocurrencias conjuntas
+kw_coll <- keywords_collocation(
+  x = terms_relev,
+  term = "lemma",
+  group = "doc_id",
+  n_min = 5   # ajustamos más/menos estrictos
+)
+
+# 3) Orden robusto: por 'pmi' si existe; si no, por 'freq'
+orden_col <- if ("pmi" %in% names(kw_coll)) "pmi" else "freq"
+kw_coll_ord <- kw_coll[order(-kw_coll[[orden_col]]), ]
+
+# 4) Vista interactiva top 30
+reactable::reactable(
+  head(kw_coll_ord, 30),
+  searchable = TRUE,
+  pagination = TRUE,
+  defaultPageSize = 10,
+  defaultSorted = orden_col,
+  defaultSortOrder = "desc",
+  columns = list(
+    keyword = reactable::colDef(name = "Colocación"),
+    freq = reactable::colDef(name = "Frecuencia"),
+    pmi = if ("pmi" %in% names(kw_coll)) reactable::colDef(name = "PMI") else NULL
+  )
+)
+```
+
+```{r frases_nominales, message=FALSE, warning=FALSE}
+# --- Extracción de frases nominales ---
+# Creamos la columna con la etiqueta de frase
+anotaciones_df$phrase_tag <- as_phrasemachine(anotaciones_df$upos, type = "upos")
+
+# Patrón: secuencia de adjetivos y sustantivos terminada en sustantivo
+kw_phrases <- keywords_phrases(
+  x = anotaciones_df$phrase_tag,
+  term = tolower(anotaciones_df$token),
+  pattern = "(A|N)*N(P+D*(A|N)*N)*",  # patrón de frases nominales
+  is_regex = TRUE, detailed = FALSE
+)
+
+# Filtramos frases frecuentes
+kw_phrases <- subset(kw_phrases, ngram > 1 & freq > 3)
+
+reactable::reactable(
+  head(kw_phrases[order(-kw_phrases$freq), ], 30),
+  searchable = TRUE,
+  defaultSorted = "freq",
+  defaultSortOrder = "desc"
+)
+```
+```{r textrank_keywords, message=FALSE, warning=FALSE}
+# --- TextRank (versión robusta para distintas salidas del paquete) ---
+
+# 1) Máscara de términos relevantes
+rel_mask <- anotaciones_df$upos %in% c("NOUN", "ADJ", "PROPN")
+
+# 2) Ejecutamos TextRank
+kw_tr_obj <- textrank::textrank_keywords(
+  x = anotaciones_df$lemma,
+  relevant = rel_mask,
+  sep = " "
+)
+
+# 3) Pasamos a data.frame y normalizamos nombres de columnas
+df_tr <- as.data.frame(kw_tr_obj$keywords)
+
+# Si la columna de texto no se llama 'keyword',renombramos
+if (!"keyword" %in% names(df_tr) && "term" %in% names(df_tr)) {
+  names(df_tr)[names(df_tr) == "term"] <- "keyword"
+}
+
+# 4) Elegimos la mejor columna disponible para ordenar
+sort_col <- dplyr::case_when(
+  "textrank_score" %in% names(df_tr) ~ "textrank_score",
+  "textrank" %in% names(df_tr)       ~ "textrank",
+  "freq" %in% names(df_tr)           ~ "freq",
+  TRUE ~ names(df_tr)[2]  # fallback: la segunda columna que exista
+)
+
+df_tr <- df_tr[order(-df_tr[[sort_col]]), ]
+
+# 5) Definimos columnas para reactable según existan
+cols <- list(keyword = reactable::colDef(name = "Keyword"))
+if ("textrank_score" %in% names(df_tr)) cols$textrank_score <- reactable::colDef(name = "Score")
+if ("textrank" %in% names(df_tr))       cols$textrank       <- reactable::colDef(name = "Score")
+if ("freq" %in% names(df_tr))           cols$freq           <- reactable::colDef(name = "Frecuencia")
+
+# 6) Tabla interactiva
+reactable::reactable(
+  head(df_tr, 30),
+  searchable = TRUE,
+  pagination = TRUE,
+  defaultPageSize = 10,
+  defaultSorted = sort_col,
+  defaultSortOrder = "desc",
+  columns = cols
+)
+```
+
+## Conclusiones del punto 6. Palabras clave
+
+Los cuatro métodos aplicados han permitido obtener perspectivas complementarias:
+
+- **RAKE** ha identificado principalmente **nombres propios y entidades** (artistas, instituciones, premios).  
+- **PMI/colocaciones** ha resaltado **pares de palabras significativas**, donde aparecen de forma destacada **pintores clásicos y contemporáneos**.  
+- **Frases nominales** han aportado **contexto temático**, detectando expresiones frecuentes relacionadas con conferencias, exposiciones y periodos artísticos (ej. *siglo de oro*, *santo domingo*).  
+- **TextRank** ha confirmado los **términos nucleares del discurso** del Museo del Prado: *prado, museo, arte, exposición, obra, españa*.  
+
+En conjunto, estos métodos refuerzan la idea de que la comunicación de la cuenta gira en torno a **artistas concretos, exposiciones relevantes y ejes temáticos clásicos** de la historia del arte, con especial presencia del **Siglo de Oro**.
+
+# **7. Relaciones entre términos**
+
+En este apartado analizamos las **relaciones entre palabras** en los tuits del Museo del Prado.  
+Más allá de las frecuencias individuales o de las palabras clave, nos interesa estudiar **qué términos aparecen juntos** en los textos y **cómo se correlacionan** entre sí.  
+
+- **Coocurrencias**: cuentan cuántas veces dos términos aparecen en el mismo contexto (mismo documento, misma oración o cercanos en el texto).  
+- **Correlaciones**: miden el grado en que dos términos aparecen juntos de forma consistente, incluso aunque no sean muy frecuentes de manera individual.  
+
+Este análisis nos permite descubrir **asociaciones relevantes entre artistas, exposiciones y conceptos**, proporcionando una base sólida para extraer temáticas y redes de significado.
+
+```{r coocurrencias_y_correlaciones, message=FALSE, warning=FALSE}
+# --- Selección de términos relevantes ---
+terminos_rel <- subset(
+  anotaciones_df,
+  upos %in% c("NOUN", "ADJ", "PROPN")
+)
+
+# === 7.1 Coocurrencias ===
+# Coocurrencias por documento (tuit)
+cooc_doc <- cooccurrence(
+  x = terminos_rel,
+  term = "lemma",
+  group = "doc_id"
+)
+
+# Coocurrencias por proximidad (skipgram = 1 → incluye la palabra siguiente)
+cooc_skip <- cooccurrence(
+  x = terminos_rel$lemma,
+  skipgram = 1
+)
+
+# Vista top 30 coocurrencias por documento
+reactable::reactable(
+  head(cooc_doc[order(-cooc_doc$cooc, cooc_doc$term1), ], 30),
+  searchable = TRUE,
+  defaultSorted = "cooc",
+  defaultSortOrder = "desc"
+)
+
+# === 7.2 Correlaciones ===
+# Identificador único por oración
+anotaciones_df$id_sent <- unique_identifier(anotaciones_df, fields = c("doc_id", "sentence_id"))
+
+# Construcción de matriz documento-término por oración
+dtf <- document_term_frequencies(
+  x = subset(anotaciones_df, upos %in% c("NOUN", "ADJ", "PROPN")),
+  document = "id_sent",
+  term = "lemma"
+)
+dtm <- document_term_matrix(dtf)
+
+# Eliminamos términos muy poco frecuentes (minfreq = 7 para mayor estabilidad)
+dtm <- dtm_remove_lowfreq(dtm, minfreq = 7)
+
+# Matriz de correlación de términos (Pearson)
+corr_mat <- dtm_cor(dtm)
+
+# Convertimos en dataframe de coocurrencia
+corr_df <- as_cooccurrence(corr_mat)
+
+# Filtramos correlaciones altas (ejemplo: > 0.25)
+corr_df <- subset(corr_df, term1 < term2 & abs(cooc) > 0.25)
+corr_df <- corr_df[order(-corr_df$cooc), ]
+
+# Vista top 30 correlaciones
+reactable::reactable(
+  head(corr_df, 30),
+  searchable = TRUE,
+  defaultSorted = "cooc",
+  defaultSortOrder = "desc"
+)
+```
+
+```{r red_coocurrencias, message=FALSE, warning=FALSE}
+# --- Visualización de coocurrencias con igraph/ggraph (con color) ---
+
+# Selección de coocurrencias fuertes
+cooc_top <- subset(cooc_doc, cooc >= 15)
+
+# Grafo
+grafo <- igraph::graph_from_data_frame(cooc_top)
+
+# Calculamos grado de cada nodo (nº de conexiones)
+V(grafo)$grado <- igraph::degree(grafo)
+
+# Dibujo con color en función del grado
+ggraph::ggraph(grafo, layout = "fr") +
+  ggraph::geom_edge_link(aes(width = cooc), alpha = 0.4, colour = "grey70") +
+  ggraph::geom_node_point(aes(size = grado, color = grado)) +
+  ggraph::geom_node_text(aes(label = name), repel = TRUE, size = 4) +
+  scale_edge_width(range = c(0.3, 2)) +
+  scale_color_gradient(low = "#3AAFA9", high = "#FE6F5E") +
+  labs(title = "Red de coocurrencias (términos relevantes)") +
+  theme_void()
+```
+## Conclusiones coocurrencias y correlaciones
+
+El análisis de coocurrencias y correlaciones muestra que:
+
+- Los términos **más centrales** en la red son *museo, prado, obra, arte*, que actúan como ejes estructurales del discurso.  
+- Se observan **asociaciones temáticas** significativas, como *domingo – greco – antiguo*, *escultura – siglo*, o *españa – social*.  
+- En la periferia aparecen **subtemas concretos** vinculados a artistas (*Zurbarán, Veronese, Rubens*), a botánica (*cidra – naranjo*) y a actividades académicas (*universidad complutense, conferencia*).  
+
+En conjunto, estas relaciones confirman que la comunicación de la cuenta combina un **núcleo institucional muy marcado** con referencias específicas a **artistas, exposiciones y proyectos culturales**.
+
+# **8. Clasificación temática exploratoria**
+
+### Identificación de pintores y exposiciones
+
+Examinando las tablas de coocurrencias y correlaciones obtenidas en el punto anterior, podemos identificar claramente varios **pintores**:
+
+- **El Greco**, asociado a los términos *domingo* y *antiguo*.  
+- **Goya** y **Velázquez**, en relación con *obra*, *muestra* y *siglo de oro*.  
+- **Rubens**, vinculado a *barroco* y *pintura*.  
+- **Veronese**, relacionado con *exposición* y *catálogo*.  
+- **Caravaggio** y **Madrazo**, presentes en cadenas menores.
+
+En cuanto a **exposiciones y temáticas**, destacan:
+
+- El periodo **Siglo de Oro** como eje central.  
+- Referencias a **catálogo**, **proyecto** y **transformación** como actividades institucionales.  
+- La mención de **muestra** y **conferencia** en contexto académico y divulgativo.
+
+A modo ilustrativo, algunas relaciones extraídas son:
+
+- `greco – domingo – antiguo`  
+- `rubens – barroco – pintura`  
+- `veronese – exposición – catálogo`  
+
+- Por último, seleccionamos los tuits que contienen **“Santo Domingo”** y **“Veronese”**, mostrando los cinco más antiguos y sus coocurrencias asociadas.
+
+```{r clasificacion_tematica, message=FALSE, warning=FALSE}
+# ------------------------------
+# 8.4 Búsquedas focalizadas (Santo Domingo / Veronese)
+# ------------------------------
+
+# Reconstruimos coocurrencias normalizadas (sustituye a 'tmp')
+cooc_src <- if (exists("cooc_doc_df")) cooc_doc_df else cooc_doc
+cooc_norm <- as.data.frame(cooc_src)
+cooc_norm$term1 <- tolower(cooc_norm$term1)
+cooc_norm$term2 <- tolower(cooc_norm$term2)
+
+htmltools::h3("Tuits con 'Santo Domingo' (5 primeros por fecha)")
+santo_dom <- prado_filtrado[grepl("Santo Domingo", prado_filtrado$texto, ignore.case = TRUE), ]
+santo_dom <- santo_dom[order(santo_dom$fecha), , drop = FALSE]
+if (nrow(santo_dom) > 0) {
+  reactable::reactable(
+    utils::head(santo_dom[, c("fecha","texto","url")], 5),
+    searchable = TRUE,
+    defaultSorted = "fecha",
+    defaultSortOrder = "asc",
+    columns = list(
+      fecha = reactable::colDef(name = "Fecha"),
+      texto = reactable::colDef(name = "Texto", minWidth = 560),
+      url   = reactable::colDef(
+        name = "Enlace",
+        minWidth = 120,
+        html = TRUE,
+        cell = function(value) if (!is.na(value) && nzchar(value)) htmltools::tags$a(href = value, target = "_blank", "Abrir")
+      )
+    )
+  )
+} else {
+  htmltools::p("No se han encontrado tuits con 'Santo Domingo' en el intervalo analizado.")
+}
+
+htmltools::h3("Coocurrencias relacionadas con 'Santo'/'Domingo'")
+cooc_santo <- cooc_norm[
+  cooc_norm$term1 %in% c("santo","domingo") | cooc_norm$term2 %in% c("santo","domingo"),
+  , drop = FALSE
+]
+if (nrow(cooc_santo) > 0) {
+  cooc_santo <- cooc_santo[order(-cooc_santo$cooc), , drop = FALSE]
+  reactable::reactable(
+    utils::head(cooc_santo, 30),
+    searchable = TRUE,
+    defaultSorted = "cooc",
+    defaultSortOrder = "desc"
+  )
+} else {
+  htmltools::p("No se han encontrado coocurrencias para 'Santo'/'Domingo'.")
+}
+
+htmltools::h3("Tuits con 'Veronese' (5 primeros por fecha)")
+veronese <- prado_filtrado[grepl("Veronese", prado_filtrado$texto, ignore.case = TRUE), ]
+veronese <- veronese[order(veronese$fecha), , drop = FALSE]
+if (nrow(veronese) > 0) {
+  reactable::reactable(
+    utils::head(veronese[, c("fecha","texto","url")], 5),
+    searchable = TRUE,
+    defaultSorted = "fecha",
+    defaultSortOrder = "asc"
+  )
+} else {
+  htmltools::p("No se han encontrado tuits con 'Veronese' en el intervalo analizado.")
+}
+
+htmltools::h3("Coocurrencias relacionadas con 'Veronese'")
+cooc_veronese <- cooc_norm[
+  cooc_norm$term1 == "veronese" | cooc_norm$term2 == "veronese",
+  , drop = FALSE
+]
+if (nrow(cooc_veronese) > 0) {
+  cooc_veronese <- cooc_veronese[order(-cooc_veronese$cooc), , drop = FALSE]
+  reactable::reactable(
+    utils::head(cooc_veronese, 30),
+    searchable = TRUE,
+    defaultSorted = "cooc",
+    defaultSortOrder = "desc"
+  )
+} else {
+  htmltools::p("No se han encontrado coocurrencias para 'Veronese'.")
+}
+```
+
+# **9. Word embeddings con GloVe y visualización con UMAP**
+
+Entrenamos embeddings con **GloVe** a partir de los tuits, usando **lemas** y filtrando por **NOUN/ADJ/PROPN**.  
+El corpus se organiza por documento (cada tuit es un documento), se crea la **matriz de coocurrencias (TCM)**, se ajusta GloVe con una configuración robusta y, a partir de los vectores resultantes, se:
+- consultan **similitudes** para *greco*, *ecce*, *tríptico*, *falomir*, y  
+- proyecta un subconjunto de términos con **UMAP** para inspeccionar la estructura semántica.
+
+De este modo, pasamos de un análisis estadístico de frecuencias y coocurrencias a una representación continua de las palabras, que captura relaciones más sutiles de proximidad semántica.
+
+```{r word_embeddings_glove, message=FALSE, warning=FALSE}
+
+library(ggplot2)
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(ggrepel))
+
+# --- 9.1 Tokens por documento ---
+df_tokens <- anotaciones_df %>%
+  filter(upos %in% c("NOUN","ADJ","PROPN"), !is.na(lemma), nzchar(lemma)) %>%
+  mutate(lemma = tolower(lemma)) %>%
+  select(doc_id, lemma)
+
+if (!nrow(df_tokens)) {
+  warning("No hay tokens válidos (NOUN/ADJ/PROPN) para entrenar GloVe. Revisa el filtrado temporal.")
+}
+
+tokens_by_doc <- split(df_tokens$lemma, df_tokens$doc_id)
+it <- itoken(tokens_by_doc, progressbar = FALSE)
+
+# --- 9.2 Vocabulario + pruning adaptativo (sin abortar) ---
+v0 <- create_vocabulary(it)
+
+prune_try <- function(v, tc_min, dp_max) {
+  out <- try(prune_vocabulary(v, term_count_min = tc_min, doc_proportion_max = dp_max), silent = TRUE)
+  if (inherits(out, "try-error")) return(v) else return(out)
+}
+
+vocab <- v0
+if (!is.null(vocab$vocab) && is.data.frame(vocab$vocab)) {
+  # intento 1
+  v1 <- prune_try(v0, 5, 0.5)
+  if (!is.null(v1$vocab) && nrow(v1$vocab) >= 50) vocab <- v1 else {
+    # intento 2
+    v2 <- prune_try(v0, 3, 0.7)
+    if (!is.null(v2$vocab) && nrow(v2$vocab) >= 30) vocab <- v2 else {
+      # intento 3
+      v3 <- prune_try(v0, 2, 0.9)
+      if (!is.null(v3$vocab) && nrow(v3$vocab) >= 10) vocab <- v3 else {
+        # fallback: sin pruning
+        vocab <- v0
+        message("Pruning muy restrictivo; se usa vocabulario sin podar.")
+      }
+    }
+  }
+} else {
+  vocab <- v0
+}
+
+if (is.null(vocab$vocab) || !is.data.frame(vocab$vocab) || nrow(vocab$vocab) == 0) {
+  # Último recurso: seguimos igualmente con v0; si aún así no hay términos, salimos con aviso
+  vocab <- v0
+  if (is.null(vocab$vocab) || !is.data.frame(vocab$vocab) || nrow(vocab$vocab) == 0) {
+    warning("Vocabulario vacío incluso sin pruning. Continúo sin UMAP global y solo similitudes si es posible.")
+  }
+}
+
+vectorizer <- vocab_vectorizer(vocab)
+tcm <- create_tcm(it, vectorizer, skip_grams_window = 5)
+
+# --- 9.3 GloVe (con fallback estable) ---
+fit_glove_safe <- function(tcm, rank = 50, x_max = 10, lr = 0.05, n_iter = 20) {
+  glove <- GlobalVectors$new(rank = rank, x_max = x_max, learning_rate = lr)
+  wv_main <- glove$fit_transform(tcm, n_iter = n_iter, convergence_tol = 0.01)
+  wv_ctx  <- glove$components
+  wv_main + t(wv_ctx)
+}
+
+word_vectors <- NULL
+if (!is.null(tcm) && length(tcm@x) > 0) {
+  word_vectors <- try(fit_glove_safe(tcm, rank = 50, x_max = 10, lr = 0.05, n_iter = 20), silent = TRUE)
+  if (inherits(word_vectors, "try-error") || is.null(word_vectors)) {
+    word_vectors <- fit_glove_safe(tcm, rank = 30, x_max = 10, lr = 0.015, n_iter = 25)
+  }
+} else {
+  warning("TCM vacía; no se puede entrenar GloVe.")
+}
+
+# --- 9.4 Similitudes con términos clave ---
+terminos_clave <- c("greco","ecce","tríptico","falomir")
+if (!is.null(word_vectors)) {
+  cat("\n=== Similitudes (cosine) con términos clave ===\n")
+  for (t in terminos_clave) {
+    if (t %in% rownames(word_vectors)) {
+      sim <- sim2(word_vectors, word_vectors[t, , drop = FALSE], method = "cosine", norm = "l2")[,1]
+      sim <- sort(sim, decreasing = TRUE)
+      simil_top <- head(sim[names(sim) != t], 10)
+      cat("\n->", t, "\n")
+      print(round(simil_top, 3))
+    } else {
+      cat("\n-> Aviso: término no encontrado en vocabulario:", t, "\n")
+    }
+  }
+} else {
+  message("Sin word_vectors: se omite la sección de similitudes.")
+}
+
+# Comunes: tabla de frecuencia y términos presentes
+freq_tbl <- vocab$vocab
+present_terms <- if (!is.null(word_vectors)) intersect(freq_tbl$term, rownames(word_vectors)) else character(0)
+
+# 9.5a UMAP global (forzar print)
+min_global <- 20
+if (length(present_terms) >= min_global) {
+  freq_tbl <- freq_tbl[order(-freq_tbl$term_count), , drop = FALSE]
+  top_n <- min(300, length(present_terms))
+  cand_global <- intersect(freq_tbl$term, present_terms)[1:top_n]
+
+  mat_g <- word_vectors[cand_global, , drop = FALSE]
+  set.seed(123)
+  um_g <- uwot::umap(mat_g, n_neighbors = 15, min_dist = 0.1, metric = "cosine")
+
+  df_umap_g <- data.frame(x = um_g[,1], y = um_g[,2], term = rownames(mat_g))
+  p_global <- ggplot(df_umap_g, aes(x, y, label = term)) +
+    geom_point(alpha = 0.6) +
+    ggrepel::geom_text_repel(max.overlaps = 20, size = 3) +
+    labs(title = "UMAP global de embeddings GloVe (términos frecuentes)") +
+    theme_minimal(base_size = 14)
+  print(p_global)  # <- forzamos la impresión
+} else {
+  message("UMAP global omitido (términos presentes < ", min_global, ").")
+}
+
+# 9.5b UMAP enfocado (forzar print + diagnóstico)
+terminos_clave <- c("greco","ecce","tríptico","falomir")
+focus_keys <- if (!is.null(word_vectors)) terminos_clave[terminos_clave %in% rownames(word_vectors)] else character(0)
+
+cat("\n[Diagnóstico UMAP enfocado] claves presentes:", paste(focus_keys, collapse = ", "), "\n")
+
+if (length(focus_keys) > 0) {
+  vecinos <- c()
+  for (t in focus_keys) {
+    sim <- sim2(word_vectors, word_vectors[t, , drop = FALSE], method = "cosine", norm = "l2")[,1]
+    sim <- sort(sim, decreasing = TRUE)
+    vecinos_t <- names(head(sim[names(sim) != t], 20))
+    vecinos <- c(vecinos, t, vecinos_t)
+  }
+  cand_focus <- unique(vecinos)
+  cand_focus <- intersect(cand_focus, rownames(word_vectors))
+  cat("[Diagnóstico] términos a proyectar (focus):", length(cand_focus), "\n")
+
+  if (length(cand_focus) >= 10) {
+    mat_f <- word_vectors[cand_focus, , drop = FALSE]
+    set.seed(123)
+    um_f <- uwot::umap(mat_f, n_neighbors = 10, min_dist = 0.05, metric = "cosine")
+    df_umap_f <- data.frame(x = um_f[,1], y = um_f[,2], term = rownames(mat_f))
+
+    p_focus <- ggplot(df_umap_f, aes(x, y, label = term)) +
+      geom_point(alpha = 0.7) +
+      ggrepel::geom_text_repel(max.overlaps = 40, size = 3) +
+      labs(title = "UMAP enfocado (vecinos de greco / ecce / tríptico / falomir)") +
+      theme_minimal(base_size = 14)
+    print(p_focus)  # <- forzamos la impresión
+  } else {
+    message("UMAP enfocado omitido: vecinos insuficientes (", length(cand_focus), ").")
+  }
+} else {
+  message("UMAP enfocado omitido: ninguna clave está en el vocabulario.")
+}
+```
+
+### Conclusiones Word embeddings
+
+El modelo **GloVe** entrenado sobre el corpus refleja relaciones semánticas relevantes entre los términos analizados:
+
+- **greco** aparece fuertemente vinculado a *santo, antiguo, monasterio, domingo*, lo que confirma la asociación del pintor con el ámbito religioso e histórico.  
+- **ecce** se asocia principalmente a *homo* (fórmula “Ecce Homo”) y también a *caravaggio*, reforzando la relación iconográfica.  
+- **tríptico** se relaciona con *jardín, zarzuela, bosco, delicia*, en clara alusión al **Tríptico de El Bosco** y sus contextos expositivos.  
+- **falomir** (exdirector del Prado) se vincula a *miguel, director, bénédicte, compositor, cultura*, mostrando su contexto institucional y cultural.  
+
+La **proyección UMAP enfocada** con 82 términos alrededor de estas claves evidencia clústeres diferenciados que agrupan:
+- El contexto religioso e histórico (*greco, santo, monasterio, domingo*).  
+- La dimensión artística y expositiva (*tríptico, bosco, jardín, delicia*).  
+- La dimensión institucional y académica (*falomir, director, cultura*).  
+
+En conjunto, los embeddings permiten ir más allá de las coocurrencias y frecuencias, mostrando un **espacio semántico continuo** donde los términos cercanos en el discurso del Museo del Prado aparecen también próximos en el mapa vectorial.

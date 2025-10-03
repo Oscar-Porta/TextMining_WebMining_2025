@@ -1,0 +1,676 @@
+---
+title: |
+  <b><div style="text-align: center"> Clasificación de Texto — Análisis de Sentimiento (dataset reviews) </div></b>
+author:  
+  name: Óscar Porta
+date: Agosto 2025
+output: 
+  rmdformats::readthedown:
+    code_folding: hide
+css: customOPS_tm.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.align = "center",
+  fig.width = 12,
+  fig.height = 5,
+  out.width = "100%",
+  out.height = "80%"
+)
+```
+
+En este informe realizamos clasificación de texto sobre el dataset reviews (33.025 críticas de productos de alimentación, en inglés).
+Abordaremos tres tareas:
+	1.	Clasificación multiclase por score (1–5) con fastText.
+	2.	Clasificación multiclase por sentiment (negativo / neutro / positivo) con fastText.
+	3.	Clasificación binaria por sentiment (negativo vs positivo) con fastText, Regresión Logística y Naive Bayes.
+
+El flujo de trabajo incluye: carga y exploración del dataset, preprocesado ligero del texto, partición 80/20, entrenamiento con fastText, creación de la variable sentiment, baselines clásicos con TF-IDF y evaluación mediante métricas estándar y matrices de confusión.
+
+# Librerías utilizadas y justificación
+
+- **tidyverse**: manipulación y transformación de datos; gráficos con `ggplot2`.
+- **stringr** y **lubridate**: utilidades de texto y fechas (normalización, limpieza ligera).
+- **janitor** / **skimr**: limpieza de nombres y exploración rápida del dataset.
+- **reactable**: tablas interactivas en el HTML (búsqueda, filtros, scroll).
+- **text2vec** / **Matrix**: vectorización (BoW/TF-IDF) y manejo eficiente de matrices dispersas.
+- **glmnet**: regresión logística con regularización para el baseline clásico.
+- **e1071**: implementación de **Naive Bayes** para el baseline clásico.
+- **caret**: métricas y utilidades de evaluación (matrices de confusión, *resampling*).
+- **here** / **rprojroot**: construcción de rutas robustas independiente del *working directory*.
+
+Usamos fastText oficial (CLI) invocado desde R. Esto evita depender de wrappers no mantenidos y asegura reproducibilidad en cualquier entorno (local/Colab). Preparamos los ficheros en formato __label__CLASE texto y entrenamos con fasttext supervised, evaluando con fasttext test y fasttext predict.
+
+```{r librerias_ej2, message=FALSE, warning=FALSE}
+# --- Librerías necesarias ---
+instalar_si_falta <- function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+    library(pkg, character.only = TRUE)
+  }
+}
+
+paquetes <- c(
+  # utilidades y rutas
+  "here","rprojroot","tidyverse","janitor","skimr","reactable",
+  "stringr","lubridate",
+  # ML clásico y matrices dispersas
+  "text2vec","Matrix","glmnet","e1071",
+  # métricas
+  "caret"
+)
+
+invisible(lapply(paquetes, instalar_si_falta))
+```
+
+```{r fasttext_cli_setup, message=TRUE, warning=FALSE}
+# --- Setup fastText CLI: localizar o compilar el binario y exponer 'ft_bin' ---
+ft_bin <- Sys.which("fasttext")
+
+if (!nzchar(ft_bin)) {
+  message("fastText no está en PATH. Intentando compilar localmente…")
+  dest <- "fastText_src"
+  if (!dir.exists(dest)) dir.create(dest, recursive = TRUE)
+
+  old <- getwd(); on.exit(setwd(old), add = TRUE)
+  setwd(dest)
+
+  # Clonar repo oficial si no existe
+  if (!dir.exists("fastText")) {
+    # Requiere 'git' instalado (en Colab y Linux ya viene)
+    system("git clone https://github.com/facebookresearch/fastText.git", ignore.stderr = TRUE)
+  }
+  if (!dir.exists("fastText")) {
+    stop("No se pudo clonar fastText. Instala 'git' o ejecuta en Colab/WSL.")
+  }
+
+  # Compilar (requiere 'make' y toolchain de C++)
+  setwd("fastText")
+  system("make", ignore.stderr = TRUE)
+
+  # Comprobar binario
+  candidato <- file.path(getwd(), "fasttext")
+  if (file.exists(candidato)) {
+    ft_bin <- candidato
+    # Añadir el directorio al PATH de la sesión por si llamas sin ruta completa
+    Sys.setenv(PATH = paste(dirname(ft_bin), Sys.getenv("PATH"), sep = .Platform$path.sep))
+    message("✔ fastText compilado en: ", ft_bin)
+  } else {
+    stop("No se pudo compilar fastText. En macOS instala Xcode CLT; en Windows usa WSL o Colab.")
+  }
+} else {
+  message("✔ fastText encontrado en PATH: ", ft_bin)
+}
+
+# Probar salida breve (muestra ayuda)
+try({
+  out <- system2(ft_bin, args = character(0), stdout = TRUE, stderr = TRUE)
+  cat(paste0(">> fastText CLI disponible. Líneas iniciales:\n",
+             paste(utils::head(out, 4), collapse = "\n"), "\n"))
+}, silent = TRUE)
+```
+
+# 1. Carga y chequeo del dataset `reviews`
+
+```{r carga_reviews_robusta, message=FALSE, warning=FALSE}
+# --- Carga directa del archivo evaluacion.RData ---
+
+path_rda <- "evaluacion.RData"
+cat(">> Usando RData en:\n", normalizePath(path_rda), "\n")
+
+load(path_rda)  # debe cargar: prado, reviews, documentos
+if (!exists("reviews")) stop("Tras cargar el .RData no aparece el objeto 'reviews'.")
+
+# Limpieza de nombres y creación de texto unificado (summary + text)
+reviews <- janitor::clean_names(reviews)
+reviews$txt_all <- dplyr::coalesce(reviews$summary, "") %>%
+  paste(dplyr::coalesce(reviews$text, ""), sep = " ") %>%
+  stringr::str_squish()
+
+# Chequeo rápido
+dim(reviews)
+str(reviews)
+if ("skimr" %in% rownames(installed.packages())) skimr::skim(reviews)
+```
+
+```{r vista_inicial_reviews, message=FALSE, warning=FALSE}
+# --- Vista interactiva inicial (muestra de 100 filas para fluidez) ---
+tabla_reviews <- reviews %>%
+  dplyr::transmute(
+    score,
+    summary,
+    text = stringr::str_trunc(txt_all, 220)
+  ) %>%
+  head(100)
+
+reactable::reactable(
+  data = tabla_reviews,
+  searchable = TRUE,
+  filterable = TRUE,
+  pagination = TRUE,
+  defaultPageSize = 10,
+  defaultSorted = "score",
+  defaultSortOrder = "desc",
+  columns = list(
+    score   = reactable::colDef(name = "Score (1-5)", minWidth = 100),
+    summary = reactable::colDef(name = "Summary", minWidth = 320),
+    text    = reactable::colDef(name = "Texto (unificado)", minWidth = 520)
+  )
+)
+```
+
+# 2. Preprocesado mínimo del texto
+
+Unificamos `summary + text` en una sola variable (`txt_all`), aplicamos una normalización ligera (minúsculas, eliminación de URLs/HTML y espacios repetidos) y descartamos filas sin contenido útil. Este paso prepara el corpus para fastText sin imponer un preprocesado agresivo.
+
+```{r preprocesado_minimo, message=FALSE, warning=FALSE}
+# 2.1 Unificamos texto y limpieza ligera
+norm_text <- function(x) {
+  x <- tolower(x)
+  x <- gsub("https?://\\S+|www\\.[^\\s]+", " ", x)  # URLs
+  x <- gsub("<[^>]+>", " ", x)                      # HTML tags
+  x <- gsub("[\\r\\n\\t]+", " ", x)                 # saltos/espacios raros
+  x <- gsub("\\s{2,}", " ", x)
+  trimws(x)
+}
+
+reviews <- reviews %>%
+  dplyr::mutate(
+    txt_all = paste(dplyr::coalesce(summary, ""), dplyr::coalesce(text, "")),
+    txt_all = stringr::str_squish(txt_all),
+    txt_all = norm_text(txt_all)
+  )
+
+# 2.2 Chequeo rápido de longitudes 
+reviews$nchar <- nchar(reviews$txt_all)
+summary(reviews$nchar)
+
+# 2.3 Quitamos filas totalmente vacías por precaución
+reviews <- reviews %>% dplyr::filter(nchar > 0)
+nrow(reviews)
+```
+
+Las longitudes de texto quedan con mediana ≈ 293 caracteres (Q1 ≈ 180, Q3 ≈ 491), con un máximo de 9.012. El tamaño final del corpus utilizado es de 33.025 reseñas, suficiente para entrenar un clasificador robusto.
+
+# 3. Partición 80/20 (estratificada por `score`)
+
+Dividimos el dataset en entrenamiento (80%) y prueba (20%) preservando la distribución de la variable `score`. Esta partición permite evaluar el rendimiento con datos no vistos y mantener representatividad por clase.
+
+```{r particion_80_20, message=FALSE, warning=FALSE}
+set.seed(1234)
+# Nos aseguramos de que score sea factor multinivel
+reviews$score <- factor(reviews$score, levels = sort(unique(reviews$score)))
+
+idx_train <- caret::createDataPartition(reviews$score, p = 0.8, list = FALSE)
+train_df  <- reviews[idx_train, ]
+test_df   <- reviews[-idx_train, ]
+
+dim(train_df); dim(test_df)
+table(train_df$score); table(test_df$score)
+```
+La partición produjo 26.422 filas en train y 6.603 en test. La distribución por clases se mantuvo: train {1: 2.375, 2: 1.501, 3: 2.143, 4: 3.822, 5: 16.581} y test {1: 593, 2: 375, 3: 535, 4: 955, 5: 4.145}, confirmando el fuerte desbalance hacia la clase 5.
+
+# 4. Clasificación con fastText por `score` (1–5)
+
+Entrenamos **fastText supervised** en formato `__label__<score> <texto>` con n-gramas de palabras (bigramas) y 15 épocas. Evaluamos con `fasttext test` y comparamos con la matriz de confusión en R para obtener métricas detalladas por clase.
+```{r fasttext_score_supervised, message=TRUE, warning=FALSE}
+# --- 4.1 Localizamos el binario de fastText que compilaste ---
+ft_bin <- Sys.which("fasttext")
+if (!nzchar(ft_bin)) {
+  # Ruta compilación previa
+  ft_bin <- file.path("fastText_src", "fastText", "fasttext")
+}
+stopifnot(file.exists(ft_bin))
+
+# --- 4.2 Carpeta de trabajo para los ficheros de fastText ---
+dir_ft <- file.path("outputs", "fasttext_files")
+if (!dir.exists(dir_ft)) dir.create(dir_ft, recursive = TRUE)
+
+# --- 4.3 Generamos ficheros en formato fastText: __label__<score> <texto> ---
+to_ft_line <- function(lbl, txt) {
+  paste0("__label__", lbl, " ", txt)
+}
+train_lines <- to_ft_line(train_df$score, train_df$txt_all)
+test_lines  <- to_ft_line(test_df$score,  test_df$txt_all)
+
+train_file <- file.path(dir_ft, "train_score.txt")
+test_file  <- file.path(dir_ft, "test_score.txt")
+
+writeLines(train_lines, con = train_file, useBytes = TRUE)
+writeLines(test_lines,  con = test_file,  useBytes = TRUE)
+
+# --- 4.4 Entrenamiento supervised ---
+# Ajusta hiperparámetros si quieres mayor calidad (wordNgrams=2, epoch=15, lr=0.5, minn/maxn para subword)
+model_prefix <- file.path(dir_ft, "model_score")
+args_train <- c(
+  "supervised",
+  "-input",  train_file,
+  "-output", model_prefix,
+  "-lr", "0.5",
+  "-epoch", "15",
+  "-wordNgrams", "2",
+  "-loss", "softmax"   # para multiclase
+)
+cat(">> Entrenando fastText (score)...\n")
+system2(ft_bin, args = args_train, stdout = TRUE, stderr = TRUE)
+
+# --- 4.5 Evaluación rápida con 'test' (precision@1, recall@1) ---
+model_bin <- paste0(model_prefix, ".bin")
+stopifnot(file.exists(model_bin))
+
+cat(">> Evaluando con fasttext test...\n")
+eval_out <- system2(ft_bin, args = c("test", model_bin, test_file), stdout = TRUE, stderr = TRUE)
+cat(paste(eval_out, collapse = "\n"), "\n")
+
+# --- 4.6 Predicciones para matriz de confusión en R ---
+# fastText devuelve una etiqueta por línea; la comparamos con test_df$score
+pred_file <- file.path(dir_ft, "pred_score.txt")
+pred_out  <- system2(ft_bin, args = c("predict", model_bin, test_file), stdout = TRUE, stderr = TRUE)
+writeLines(pred_out, pred_file)
+
+pred_lbl <- gsub("^__label__", "", pred_out)
+pred_lbl <- factor(pred_lbl, levels = levels(test_df$score))
+
+# Métricas en R (matriz de confusión)
+cm <- caret::confusionMatrix(pred_lbl, test_df$score)
+cm
+```
+
+### Conclusiones de clasificación por score (1–5)
+
+El modelo **fastText supervised** entrenado sobre el dataset `reviews` logra un **Accuracy global ≈ 0.71**, superando de forma clara la predicción trivial (NIR ≈ 0.63).  
+
+- La clase **5 estrellas** (muy bien) es la más fácil de detectar, con sensibilidad ≈ 0.90, gracias a su fuerte prevalencia en el corpus.  
+- La clase **1 estrella** alcanza sensibilidad ≈ 0.61, lo que muestra cierta capacidad para identificar críticas muy negativas.  
+- Las clases **2, 3 y 4 estrellas** presentan dificultades (sensibilidades entre 0.25 y 0.35), lo que refleja el **desbalance de clases** y la ambigüedad en reseñas intermedias.  
+
+En conjunto, fastText es una herramienta potente para clasificar críticas extremas (positivas/negativas), pero su rendimiento disminuye en los casos intermedios, lo que justifica el siguiente análisis por **sentimiento (negativo/neutro/positivo)**.
+
+# 5. Clasificación por sentimiento (negativo / neutro / positivo) con fastText
+
+A partir de la variable `score`, derivamos `sentiment` con la regla: `<3` negativo, `=3` neutro, `>3` positivo. Entrenamos un modelo **fastText** multiclase (3 etiquetas) y evaluamos su rendimiento global y por clase.
+
+```{r fasttext_sentiment_multiclase, message=TRUE, warning=FALSE}
+# --- 5.1 Crear variable 'sentiment' a partir de score ---
+# Reglas: <3 -> negativo, ==3 -> neutro, >3 -> positivo
+map_sent <- function(s) {
+  if (s < 3) return("negative")
+  if (s == 3) return("neutral")
+  return("positive")
+}
+train_df$sentiment <- factor(vapply(as.numeric(as.character(train_df$score)), map_sent, character(1)),
+                             levels = c("negative","neutral","positive"))
+test_df$sentiment  <- factor(vapply(as.numeric(as.character(test_df$score)), map_sent, character(1)),
+                             levels = c("negative","neutral","positive"))
+
+# Chequeo de distribución
+table(train_df$sentiment); table(test_df$sentiment)
+
+# --- 5.2 Preparar ficheros fastText ---
+ft_bin <- Sys.which("fasttext")
+if (!nzchar(ft_bin)) {
+  # Ruta tras compilar localmente 
+  ft_bin <- file.path("fastText_src", "fastText", "fasttext")
+}
+stopifnot(file.exists(ft_bin))
+
+dir_ft <- file.path("outputs", "fasttext_files")
+if (!dir.exists(dir_ft)) dir.create(dir_ft, recursive = TRUE)
+
+to_ft_line <- function(lbl, txt) paste0("__label__", lbl, " ", txt)
+
+train_sent_lines <- to_ft_line(train_df$sentiment, train_df$txt_all)
+test_sent_lines  <- to_ft_line(test_df$sentiment,  test_df$txt_all)
+
+train_sent_file <- file.path(dir_ft, "train_sent.txt")
+test_sent_file  <- file.path(dir_ft, "test_sent.txt")
+
+writeLines(train_sent_lines, con = train_sent_file, useBytes = TRUE)
+writeLines(test_sent_lines,  con = test_sent_file,  useBytes = TRUE)
+
+# --- 5.3 Entrenamiento fastText (3 clases) ---
+model_sent_prefix <- file.path(dir_ft, "model_sent")
+args_train_sent <- c(
+  "supervised",
+  "-input",  train_sent_file,
+  "-output", model_sent_prefix,
+  "-lr", "0.5",
+  "-epoch", "15",
+  "-wordNgrams", "2",
+  "-loss", "softmax"
+)
+cat(">> Entrenando fastText (sentiment)...\n")
+system2(ft_bin, args = args_train_sent, stdout = TRUE, stderr = TRUE)
+
+# --- 5.4 Evaluación (precision@1, recall@1) ---
+model_sent_bin <- paste0(model_sent_prefix, ".bin")
+stopifnot(file.exists(model_sent_bin))
+
+cat(">> Evaluando con fasttext test (sentiment)...\n")
+eval_sent <- system2(ft_bin, args = c("test", model_sent_bin, test_sent_file),
+                     stdout = TRUE, stderr = TRUE)
+cat(paste(eval_sent, collapse = "\n"), "\n")
+
+# --- 5.5 Predicciones y matriz de confusión en R ---
+pred_sent <- system2(ft_bin, args = c("predict", model_sent_bin, test_sent_file),
+                     stdout = TRUE, stderr = TRUE)
+pred_sent <- gsub("^__label__", "", pred_sent)
+pred_sent <- factor(pred_sent, levels = levels(test_df$sentiment))
+
+cm_sent <- caret::confusionMatrix(pred_sent, test_df$sentiment)
+cm_sent
+```
+### Conclusiones — Clasificación por sentimiento (negativo / neutro / positivo)
+
+El modelo fastText logra un **Accuracy global ≈ 0.87**, notablemente superior al obtenido en la clasificación directa por score (≈ 0.77).  
+
+- La clase **positiva** es la más robusta, con sensibilidad ≈ 0.96 y precisión ≈ 0.92.  
+- La clase **negativa** también se predice con solidez (sensibilidad ≈ 0.69, precisión ≈ 0.74).  
+- La clase **neutra**, minoritaria, presenta un rendimiento bajo (sensibilidad ≈ 0.34), lo que refleja la ambigüedad de las críticas intermedias.  
+
+En conjunto, la reducción a tres categorías de sentimiento ofrece un modelo más estable y con mejor capacidad discriminativa, especialmente útil para distinguir polaridades extremas.
+
+
+# 6. Clasificación binaria (negativo / positivo) con fastText
+
+Para mejorar la discriminación del modelo, eliminamos las críticas neutras y entrenamos un clasificador **binario** con fastText, diferenciando únicamente entre reseñas **negativas** y **positivas**. Este enfoque permite concentrar la capacidad predictiva en polaridades extremas, donde la señal semántica es más clara.
+
+```{r fasttext_sentiment_binario, message=TRUE, warning=FALSE}
+# --- 6.1 Filtramos train/test quitando la clase 'neutral' ---
+train_bin <- train_df %>% dplyr::filter(sentiment %in% c("negative","positive"))
+test_bin  <- test_df  %>% dplyr::filter(sentiment %in% c("negative","positive"))
+
+# Chequeo de distribución
+table(train_bin$sentiment); table(test_bin$sentiment)
+
+# --- 6.2 Preparamos ficheros fastText binarios ---
+ft_bin <- Sys.which("fasttext")
+if (!nzchar(ft_bin)) {
+  ft_bin <- file.path("fastText_src", "fastText", "fasttext")
+}
+stopifnot(file.exists(ft_bin))
+
+dir_ft <- file.path("outputs", "fasttext_files")
+if (!dir.exists(dir_ft)) dir.create(dir_ft, recursive = TRUE)
+
+to_ft_line <- function(lbl, txt) paste0("__label__", lbl, " ", txt)
+
+train_bin_lines <- to_ft_line(train_bin$sentiment, train_bin$txt_all)
+test_bin_lines  <- to_ft_line(test_bin$sentiment,  test_bin$txt_all)
+
+train_bin_file <- file.path(dir_ft, "train_sent_bin.txt")
+test_bin_file  <- file.path(dir_ft, "test_sent_bin.txt")
+
+writeLines(train_bin_lines, con = train_bin_file, useBytes = TRUE)
+writeLines(test_bin_lines,  con = test_bin_file,  useBytes = TRUE)
+
+# --- 6.3 Entrenamiento fastText (binario) ---
+model_bin_prefix <- file.path(dir_ft, "model_sent_bin")
+args_train_bin <- c(
+  "supervised",
+  "-input",  train_bin_file,
+  "-output", model_bin_prefix,
+  "-lr", "0.5",
+  "-epoch", "15",
+  "-wordNgrams", "2",
+  "-loss", "softmax"
+)
+cat(">> Entrenando fastText (sentiment binario)...\n")
+system2(ft_bin, args = args_train_bin, stdout = TRUE, stderr = TRUE)
+
+# --- 6.4 Evaluación binaria ---
+model_bin_file <- paste0(model_bin_prefix, ".bin")
+stopifnot(file.exists(model_bin_file))
+
+cat(">> Evaluando con fasttext test (binario)...\n")
+eval_bin <- system2(ft_bin, args = c("test", model_bin_file, test_bin_file),
+                    stdout = TRUE, stderr = TRUE)
+cat(paste(eval_bin, collapse = "\n"), "\n")
+
+# --- 6.5 Predicciones y matriz de confusión ---
+pred_bin <- system2(ft_bin, args = c("predict", model_bin_file, test_bin_file),
+                    stdout = TRUE, stderr = TRUE)
+pred_bin <- gsub("^__label__", "", pred_bin)
+pred_bin <- factor(pred_bin, levels = levels(train_bin$sentiment))
+
+cm_bin <- caret::confusionMatrix(pred_bin, test_bin$sentiment)
+cm_bin
+```
+
+### Conclusiones del Punto 6 — Clasificación binaria con fastText
+
+El modelo binario alcanza un **Accuracy global ≈ 0.94**, con un acuerdo sustancial reflejado en un **Kappa ≈ 0.76**.  
+
+- La clase **positiva** se detecta con una sensibilidad muy alta (≈ 0.98) y precisión ≈ 0.95, lo que confirma la fortaleza del modelo en la clase mayoritaria.  
+- La clase **negativa** también mejora respecto al escenario multiclase, alcanzando sensibilidad ≈ 0.75 y precisión ≈ 0.86.  
+- El **Balanced Accuracy ≈ 0.86** muestra un buen equilibrio entre ambas polaridades, superando ampliamente los resultados obtenidos en las clases minoritarias en los puntos anteriores.  
+
+En resumen, la reducción a dos categorías extremas (positivo/negativo) ofrece el mejor rendimiento del ejercicio, con un clasificador rápido, interpretable y muy eficaz para tareas de análisis de sentimiento polarizado.
+
+# 7. Clasificación binaria con Regresión Logística
+
+Además de fastText, aplicamos un modelo clásico de **Regresión Logística** sobre el corpus reducido a polaridades extremas (negativo / positivo). Para ello, transformamos los textos en una matriz dispersa de términos mediante `text2vec` (con TF–IDF) y entrenamos un clasificador logístico regularizado con `glmnet`. Este enfoque nos permite comparar el rendimiento de un modelo lineal tradicional frente a fastText.
+
+```{r logit_sentiment_binario, message=FALSE, warning=FALSE}
+
+# --- 7.1 Dataset binario (viene del Punto 6) ---
+# Esperamos objetos: train_bin, test_bin con columnas: txt_all, sentiment (levels: negative, positive)
+
+# Aseguramos niveles y orden
+y_train <- factor(train_bin$sentiment, levels = c("negative","positive"))
+y_test  <- factor(test_bin$sentiment,  levels = c("negative","positive"))
+
+# --- 7.2 Tokenización/Vectorización con ids de documento (no usar etiquetas como ids) ---
+set.seed(123)
+it_train <- itoken(tolower(train_bin$txt_all),
+                   tokenizer = word_tokenizer,
+                   ids = seq_len(nrow(train_bin)),
+                   progressbar = FALSE)
+vocab <- create_vocabulary(it_train)
+vectorizer <- vocab_vectorizer(vocab)
+
+dtm_train <- create_dtm(it_train, vectorizer)
+
+tfidf <- TfIdf$new()
+dtm_train_tfidf <- tfidf$fit_transform(dtm_train)
+
+# Test con el mismo vectorizador y TF-IDF fitted en train
+it_test <- itoken(tolower(test_bin$txt_all),
+                  tokenizer = word_tokenizer,
+                  ids = seq_len(nrow(test_bin)),
+                  progressbar = FALSE)
+dtm_test <- create_dtm(it_test, vectorizer)
+dtm_test_tfidf <- tfidf$transform(dtm_test)
+
+# --- 7.3 Respuesta binaria 0/1 para glmnet (1 = positive) ---
+y_train_num <- as.integer(y_train == "positive")
+
+# --- 7.4 CV estratificada: foldid con ambas clases en cada fold ---
+set.seed(123)
+folds <- caret::createFolds(y_train, k = 5, returnTrain = FALSE)
+foldid <- integer(length(y_train))
+for (i in seq_along(folds)) foldid[folds[[i]]] <- i
+
+# --- 7.5 Entrenamiento Regresión Logística (glmnet) con folds estratificados ---
+modelo_logit <- glmnet::cv.glmnet(
+  x = dtm_train_tfidf,
+  y = y_train_num,
+  family = "binomial",
+  type.measure = "class",
+  foldid = foldid
+)
+
+# --- 7.6 Evaluación en test ---
+pred_prob <- as.numeric(predict(modelo_logit, dtm_test_tfidf, s = "lambda.min", type = "response"))
+pred_cls  <- ifelse(pred_prob > 0.5, "positive", "negative")
+pred_cls  <- factor(pred_cls, levels = levels(y_test))
+
+cm_logit <- caret::confusionMatrix(pred_cls, y_test)
+cm_logit
+```
+
+## Conclusiones — Regresión Logística binaria
+
+El modelo de regresión logística con TF–IDF alcanza un **Accuracy ≈ 0.91** y un **Kappa ≈ 0.63**, mostrando un rendimiento competitivo aunque algo inferior a fastText.  
+
+- La clase **negativa** obtiene una sensibilidad de ≈ 0.61 y una precisión ≈ 0.78.  
+- La clase **positiva** es reconocida con muy alta especificidad (≈ 0.97), reflejando la tendencia del modelo a favorecer la clase mayoritaria.  
+- El **Balanced Accuracy ≈ 0.79** confirma un comportamiento aceptable, pero menos equilibrado que fastText.  
+
+En resumen, la regresión logística constituye un baseline interpretable y sólido, aunque no logra superar el rendimiento alcanzado con fastText en la clasificación binaria.
+
+# 8. Clasificación binaria con Naive Bayes
+
+Inicialmente intentamos un Naive Bayes clásico sobre la representación TF–IDF, pero el modelo colapsaba hacia una sola clase debido al fuerte desbalance y la alta dimensionalidad del vocabulario.  
+Para resolverlo optamos por la implementación **multinomial de Naive Bayes** con `quanteda.textmodels`, aplicando filtrado de términos poco informativos. Este enfoque proporciona un baseline ligero y funcional, adecuado para comparar con fastText y regresión logística en la tarea binaria (negativo/positivo).
+
+```{r naive_bayes_binario, message=FALSE, warning=FALSE}
+# --- Naive Bayes binario (negative / positive) con quanteda.textmodels ---
+
+# 0) Paquetes
+instalar_si_falta <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+}
+instalar_si_falta("quanteda")
+instalar_si_falta("quanteda.textmodels")
+instalar_si_falta("caret")
+
+suppressPackageStartupMessages({
+  library(quanteda)
+  library(quanteda.textmodels)
+})
+
+# 1) Datos
+y_train_nb <- factor(train_bin$sentiment, levels = c("negative","positive"))
+y_test_nb  <- factor(test_bin$sentiment,  levels = c("negative","positive"))
+
+# 2) Tokens mínimos 
+toks_train <- tokens(
+  tolower(train_bin$txt_all),
+  remove_punct = TRUE, remove_numbers = TRUE
+) %>%
+  tokens_remove(stopwords("en")) %>%
+  tokens_wordstem(language = "en")
+
+toks_test <- tokens(
+  tolower(test_bin$txt_all),
+  remove_punct = TRUE, remove_numbers = TRUE
+) %>%
+  tokens_remove(stopwords("en")) %>%
+  tokens_wordstem(language = "en")
+
+# 3) DFM y trim en DOS PASOS (compatibles con quanteda 4.3.1)
+dfm_train <- dfm(toks_train)
+# 3a) Mantenemos términos que aparezcan en ≥ 10 documentos (conteo absoluto)
+dfm_train <- dfm_trim(dfm_train, min_docfreq = 10, docfreq_type = "count")
+# 3b) Quitamos términos que aparezcan en > 80% de documentos (proporción)
+dfm_train <- dfm_trim(dfm_train, max_docfreq = 0.8, docfreq_type = "prop")
+
+# 4) DFM de test alineada con el vocabulario de train
+dfm_test <- dfm(toks_test)
+dfm_test <- dfm_match(dfm_test, features = featnames(dfm_train))
+
+# 5) Entrenamiento Naive Bayes Multinomial (texto) — SIN argumentos inexistentes
+nb_mod <- textmodel_nb(
+  x = dfm_train,
+  y = y_train_nb,
+  prior = "uniform",          # priors uniformes para no sesgar por frecuencia
+  distribution = "multinomial",
+  smooth = 1                  # suavizado (Laplace-like)
+)
+
+# 6) Predicción y métricas
+pred_nb <- predict(nb_mod, newdata = dfm_test)
+cm_nb   <- caret::confusionMatrix(factor(pred_nb, levels = levels(y_test_nb)), y_test_nb)
+cm_nb
+```
+
+### Conclusiones del Punto 8 — Naive Bayes binario
+
+El modelo **Naive Bayes multinomial** con `quanteda.textmodels` alcanza un **Accuracy global ≈ 0.87** y un **Kappa ≈ 0.59**, superando el azar (NIR ≈ 0.84) pero quedando por debajo de fastText y de la regresión logística.  
+
+- La clase **positiva** domina en precisión (≈ 0.96), con un buen equilibrio entre sensibilidad y especificidad.  
+- La clase **negativa**, en cambio, muestra limitaciones: aunque detecta alrededor del **81 %** de los casos (sensibilidad), su precisión cae a ≈ 0.57, lo que refleja un alto número de falsos negativos.  
+- El **Balanced Accuracy ≈ 0.85** indica que el modelo mantiene cierta capacidad discriminativa, pero su rendimiento en la clase minoritaria es claramente insuficiente.  
+
+En resumen, Naive Bayes resulta un baseline rápido y ligero, pero confirma sus limitaciones en corpus desbalanceados, siendo menos competitivo frente a fastText y regresión logística.
+
+# 9. Comparativa global de modelos
+
+Para cerrar el ejercicio, comparamos de manera sintética los diferentes enfoques aplicados.  
+La tabla resume métricas clave de rendimiento (Accuracy, Kappa, Balanced Accuracy y observaciones relevantes).  
+
+De esta forma podemos contrastar la evolución desde la clasificación por score hasta los modelos binarios, observando cómo fastText ofrece el mejor rendimiento, la regresión logística constituye un baseline sólido y Naive Bayes presenta limitaciones claras en este contexto.
+
+```{r comparativa_modelos, message=FALSE, warning=FALSE}
+# --- 9.1 Resumen de resultados obtenidos (actualizados) ---
+resumen_modelos <- tibble::tribble(
+  ~Modelo,                          ~Accuracy, ~Kappa, ~BalancedAcc, ~Observaciones,
+  "fastText (score 1–5)",            0.707,    0.458,  0.620,        "Mejor en clase 5; flojo en clases intermedias.",
+  "fastText (sentiment 3 clases)",   0.868,    0.622,  0.760,        "Muy bueno en positivo; neutro difícil de predecir.",
+  "fastText (binario pos/neg)",      0.940,    0.764,  0.860,        "Excelente en ambas polaridades; mejor modelo global.",
+  "Regresión Logística (binario)",   0.910,    0.632,  0.790,        "Buen baseline; pierde sensibilidad en negativos.",
+  "Naive Bayes (binario)",           0.871,    0.590,  0.845,        "Rinde bien en general; precisión baja en negativos."
+)
+
+# --- 9.2 Tabla interactiva con reactable ---
+reactable::reactable(
+  resumen_modelos,
+  searchable = TRUE,
+  striped = TRUE,
+  highlight = TRUE,
+  defaultColDef = reactable::colDef(align = "center"),
+  columns = list(
+    Modelo = reactable::colDef(name = "Modelo"),
+    Accuracy = reactable::colDef(format = reactable::colFormat(digits = 3)),
+    Kappa = reactable::colDef(format = reactable::colFormat(digits = 3)),
+    BalancedAcc = reactable::colDef(name = "Balanced Accuracy", format = reactable::colFormat(digits = 3)),
+    Observaciones = reactable::colDef(minWidth = 380, align = "left")
+  ),
+  defaultPageSize = 5,
+  theme = reactable::reactableTheme(
+    headerStyle = list(background = "#f7f7f7", fontWeight = "bold")
+  )
+)
+
+# --- 9.3 Barplot comparativo (Accuracy y Kappa) ---
+plot_df <- resumen_modelos |>
+  dplyr::select(Modelo, Accuracy, Kappa) |>
+  tidyr::pivot_longer(cols = c(Accuracy, Kappa),
+                      names_to = "Metrica", values_to = "Valor") |>
+  dplyr::mutate(Modelo = forcats::fct_reorder(Modelo, Valor, .fun = max))
+
+ggplot2::ggplot(plot_df, ggplot2::aes(x = Modelo, y = Valor, fill = Metrica)) +
+  ggplot2::geom_col(width = 0.65, position = "dodge") +
+  ggplot2::geom_text(ggplot2::aes(label = sprintf("%.3f", Valor)),
+                     position = ggplot2::position_dodge(width = 0.65),
+                     hjust = -0.1, size = 3.5) +
+  ggplot2::coord_flip() +
+  ggplot2::scale_fill_manual(values = c("Accuracy" = "#1f78b4", "Kappa" = "#ff7f00")) +
+  ggplot2::labs(
+    title = "Comparativa de modelos: Accuracy y Kappa",
+    x = NULL, y = "Valor (0–1)",
+    fill = "Métrica"
+  ) +
+  ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(
+    panel.grid.minor = ggplot2::element_blank(),
+    strip.text = ggplot2::element_text(face = "bold")
+  )
+```
+
+### Conclusiones — Comparativa global
+
+La comparativa muestra que **fastText** es el modelo más potente en este escenario:  
+- En multiclase por score ya supera el azar, pero con limitaciones en las clases intermedias.  
+- En multiclase por sentimiento mejora notablemente (Accuracy ≈ 0.87).  
+- En binario (positivo/negativo) ofrece el mejor resultado global (Accuracy ≈ 0.94, Kappa ≈ 0.76).  
+
+La **regresión logística** constituye un baseline sólido y explicable (Accuracy ≈ 0.91), pero con menor sensibilidad en negativos.  
+El **Naive Bayes**, ofrece un rendimiento competente (Accuracy ≈ 0.87, Kappa ≈ 0.59, Balanced Acc ≈ 0.85). No supera a fastText, pero sí es útil como baseline ligero; su punto débil está en la precisión para negativos. 
+
+En conjunto, fastText binario se confirma como la mejor opción para análisis polarizado de sentimiento en este corpus.

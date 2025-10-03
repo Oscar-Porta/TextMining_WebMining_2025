@@ -1,0 +1,1159 @@
+---
+title: |
+  <b><div style="text-align: center"> LLM — Embeddings, UMAP y Clustering (dataset documentos) </div></b>
+author:  
+  name: Óscar Porta
+date: Agosto 2025
+output: 
+  rmdformats::readthedown:
+    code_folding: hide
+css: customOPS_tm.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.align = "center",
+  fig.width = 12,
+  fig.height = 5,
+  out.width = "100%",
+  out.height = "80%"
+)
+```
+
+# 1. Introducción
+En este informe trabajamos con el dataset **documentos** (106 oraciones) y abordamos tres vías complementarias:
+
+1. **BERT (Hugging Face)**: obtención de *sentence embeddings* con `hiiamsid/sentence_similarity_spanish_es`, proyección **UMAP** y **clustering KMeans (k=7)**; asignación de categorías por similitud (Clima, Cocina, Deportes, Finanzas, Historia, Música, Tecnología). 
+
+2. **Qwen3 (Ollama)**: *embeddings* locales con el modelo `dengcao/Qwen3-Embedding-4B:Q4_K_M`, UMAP y KMeans (k=7); asignación de categorías por similitud.  
+
+3. **Gemini (ellmer)**: clasificación directa de cada documento en una de las siete categorías.  
+
+Finalmente, se comparan las predicciones de **Gemini** con los resultados de **BERT** y **Qwen3**, destacando las discrepancias.  
+
+---
+
+# 2. Librerías utilizadas y justificación
+
+- **tidyverse**: manipulación de datos, apoyo a la visualización con `ggplot2`.  
+- **reactable**: tablas interactivas para el HTML.  
+- **uwot**: reducción de dimensionalidad con **UMAP** en R.  
+- **reticulate**: puente a **Python** para cargar BERT (Hugging Face) sin salir de RStudio.  
+- **ollamar** y **httr2/jsonlite**: interacción con **Ollama** (modelos locales) y parsing JSON.  
+- **ellmer**: cliente R para **Gemini** (clasificación).  
+- **readr/stringr/janitor/skimr**: utilidades de entrada/salida y exploración.  
+
+
+
+```{r librerias_llm, message=FALSE, warning=FALSE}
+# --- Librerías necesarias para el Ejercicio 3 (LLM) ---
+instalar_si_falta <- function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+    library(pkg, character.only = TRUE)
+  }
+}
+
+paquetes <- c(
+  # core & utilidades
+  "tidyverse","stringr","readr","janitor","skimr",
+  # visualización y tablas
+  "ggplot2","reactable",
+  # UMAP en R
+  "uwot",
+  # Python desde R (BERT)
+  "reticulate",
+  # Ollama desde R (Qwen3) + HTTP/JSON
+  "ollamar","httr2","jsonlite",
+  # Gemini (según enunciado)
+  "ellmer"
+)
+
+invisible(lapply(paquetes, instalar_si_falta))
+
+set.seed(42)
+cat("Librerías R cargadas.\n")
+```
+
+# 3. Carga del dataset **documentos**
+
+Cargamos `evaluacion.RData`, verificamos la presencia del objeto **documentos** (con columnas `doc_id` y `texto`) y realizamos una inspección rápida con tabla interactiva y resumen.
+
+```{r carga_documentos, message=FALSE, warning=FALSE}
+# --- 3) Carga del dataset 'documentos' y chequeos básicos ---
+
+# --- Carga directa del archivo .RData ---
+load("evaluacion.RData")   # Carga: prado, reviews, documentos
+
+# --- Confirmación rápida ---
+cat("Archivo 'evaluacion.RData' cargado correctamente.\n")
+ls()
+
+# 3) Normalización ligera de nombres y tipos
+documentos <- tibble::as_tibble(documentos) |>
+  janitor::clean_names() |>
+  dplyr::rename(doc_id = doc_id, texto = texto) |>
+  dplyr::mutate(
+    doc_id = as.character(doc_id),
+    texto  = as.character(texto)
+  )
+
+# 4) Vista interactiva (primeras 15 filas)
+reactable::reactable(
+  documentos |>
+    dplyr::select(doc_id, texto) |>
+    dplyr::slice(1:15),
+  searchable = TRUE,
+  pagination = TRUE,
+  defaultPageSize = 5,
+  columns = list(
+    doc_id = reactable::colDef(name = "Documento", minWidth = 120),
+    texto  = reactable::colDef(name = "Texto",     minWidth = 600)
+  ),
+  theme = reactable::reactableTheme(headerStyle = list(fontWeight = 600))
+)
+
+# 5) Recuento de filas (interactivo)
+reactable::reactable(
+  tibble::tibble(`Nº de documentos` = nrow(documentos)),
+  pagination = FALSE
+)
+
+# 6) Resumen (si 'skimr' está disponible)
+if ("skimr" %in% rownames(installed.packages())) {
+  suppressMessages(print(skimr::skim(documentos)))
+}
+```
+
+# 4. Clustering con BERT (reticulate)
+
+Obtenemos *sentence embeddings* con el modelo `hiiamsid/sentence_similarity_spanish_es`, visualizamos con **UMAP** y realizamos **KMeans (k=7)**. La asignación de cada clúster a las categorías (Clima, Cocina, Deportes, Finanzas, Historia, Música, Tecnología) se realiza por **máxima similitud coseno** entre el centroide del clúster y los embeddings de los nombres de las categorías.
+
+```{r setup_python_reticulate, message=TRUE, warning=FALSE}
+
+# Usamos el Python del entorno recién creado
+use_python("/opt/anaconda3/envs/r-llm-conda/bin/python", required = TRUE)
+
+# Mostrar configuración 
+py_config()
+```
+
+
+```{r setup_python_bert_safe, message=TRUE, warning=FALSE}
+# --- 4.A) Comprobación de módulos Python en el entorno activo (no cambia el intérprete) ---
+
+cfg <- reticulate::py_config()
+
+cat(">> Usando Python ya inicializado en:\n   ", cfg$python, "\n")
+
+# Imprimir versión de forma robusta (a veces es lista)
+ver <- tryCatch(
+  {
+    if (!is.null(cfg$version_string)) {
+      cfg$version_string
+    } else {
+      paste0(unlist(cfg$version), collapse = " ")
+    }
+  },
+  error = function(e) NA_character_
+)
+if (!is.na(ver)) cat(">> Versión de Python: ", ver, "\n\n", sep = "")
+
+# Evita el warning de tokenizers en procesos forkeados
+Sys.setenv(TOKENIZERS_PARALLELISM = "false")
+
+needed <- c("sentence-transformers","umap-learn","scikit-learn")
+avail <- c(
+  `sentence-transformers` = reticulate::py_module_available("sentence_transformers"),
+  `umap-learn`            = reticulate::py_module_available("umap"),
+  `scikit-learn`          = reticulate::py_module_available("sklearn")
+)
+print(avail)
+
+if (!all(avail)) {
+  stop(
+    "Faltan módulos Python en el entorno actual: ",
+    paste(names(avail)[!avail], collapse = ", "),
+    call. = FALSE
+  )
+}
+```
+
+```{r bert_embeddings_umap_kmeans, message=FALSE, warning=FALSE}
+# --- 4) BERT (Hugging Face vía reticulate): Embeddings → UMAP → KMeans(k=7) → Categorías ---
+
+set.seed(123)
+
+# 4.1 Importes de Python (usa el intérprete fijado en 'setup_python_reticulate')
+st        <- import("sentence_transformers")
+umap_py   <- import("umap")
+skclust   <- import("sklearn.cluster")
+skmetrics <- import("sklearn.metrics")
+
+# 4.2 Cargar modelo SBERT en español
+cat(">> Cargando modelo BERT: hiiamsid/sentence_similarity_spanish_es\n")
+modelo_bert <- st$SentenceTransformer("hiiamsid/sentence_similarity_spanish_es")
+
+# 4.3 Embeddings de los documentos
+texts <- documentos$texto |> as.character()
+emb_py <- modelo_bert$encode(texts, show_progress_bar = TRUE)
+
+# Asegurar matriz base R
+emb <- do.call(rbind, lapply(seq_len(nrow(emb_py)), function(i) as.numeric(emb_py[i, ])))
+mode(emb) <- "numeric"
+
+# normalización L2 (útil para similitud coseno)
+l2    <- sqrt(rowSums(emb^2)) + 1e-12
+emb_n <- emb / l2
+cat(">> Shape embeddings (BERT): ", paste(dim(emb_n), collapse = " x "), "\n", sep = "")
+
+# 4.4 UMAP 2D (métrica coseno)
+um <- umap_py$UMAP(n_components = as.integer(2),
+                   n_neighbors = as.integer(15),
+                   min_dist = 0.1,
+                   metric = "cosine",
+                   random_state = as.integer(123))
+emb_2d <- um$fit_transform(emb_n)
+emb_2d <- cbind(x = as.numeric(emb_2d[,1]), y = as.numeric(emb_2d[,2]))  # asegurar vector numérico
+
+# 4.5 KMeans (k = 7)
+k  <- 7L
+km <- skclust$KMeans(n_clusters = as.integer(k), n_init = as.integer(20), random_state = as.integer(123))
+clusters <- as.integer(km$fit_predict(emb_n)) + 0L
+
+# 4.6 Silhouette (cosine)
+sil_val <- as.numeric(skmetrics$silhouette_score(emb_n, clusters, metric = "cosine"))
+cat(sprintf(">> KMeans k=%d · Silhouette (cosine): %.3f\n", k, sil_val))
+
+# 4.7 Asignación automática de categorías por similitud con prototipos
+CATS <- c("Clima","Cocina","Deportes","Finanzas","Historia","Música","Tecnología")
+
+cat(">> Calculando embeddings de prototipos de categoría…\n")
+cat_py <- modelo_bert$encode(CATS)
+cat_emb <- do.call(rbind, lapply(seq_len(nrow(cat_py)), function(i) as.numeric(cat_py[i, ])))
+mode(cat_emb) <- "numeric"
+cat_emb <- cat_emb / (sqrt(rowSums(cat_emb^2)) + 1e-12)
+
+# Centroides por clúster (en el espacio normalizado)
+centros <- vapply(sort(unique(clusters)),
+                  function(c) colMeans(emb_n[clusters == c, , drop = FALSE]),
+                  numeric(ncol(emb_n)))
+centros <- t(centros)
+centros <- centros / (sqrt(rowSums(centros^2)) + 1e-12)
+
+# Similitud coseno centroide ↔ categoría y asignación inyectiva (greedy)
+SIM <- centros %*% t(cat_emb)  # (k x 7)
+assignments <- integer(nrow(SIM)); usados <- rep(FALSE, length(CATS))
+for (ci in order(apply(SIM, 1, max), decreasing = TRUE)) {
+  ord <- order(SIM[ci, ], decreasing = TRUE)
+  j   <- ord[which(!usados[ord])[1]]; if (is.na(j)) j <- ord[1]
+  assignments[ci] <- j; usados[j] <- TRUE
+}
+cluster_to_cat <- setNames(CATS[assignments], paste0(sort(unique(clusters))))
+
+# 4.8 DataFrame final con categorías y UMAP (todo como columnas atómicas)
+df_bert <- documentos |>
+  mutate(
+    cluster_bert   = as.integer(clusters),
+    categoria_bert = unname(cluster_to_cat[as.character(clusters)])
+  ) |>
+  mutate(x = emb_2d[, "x"], y = emb_2d[, "y"])
+
+# 4.9 UMAP coloreado por categoría
+p <- ggplot(df_bert, aes(x, y, color = categoria_bert)) +
+  geom_point(alpha = 0.9, size = 2.3) +
+  labs(title = "UMAP de embeddings (BERT) — Categorías asignadas", color = "Categoría") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+print(p)
+
+# 4.10 Recuentos por categoría y vista de 20 ejemplos (usar data.frame planos)
+tab_counts <- df_bert |>
+  count(categoria_bert, name = "Documentos") |>
+  arrange(desc(Documentos)) |>
+  rename(Categoría = categoria_bert) |>
+  as.data.frame()
+
+reactable::reactable(
+  tab_counts,
+  searchable = FALSE, striped = TRUE, highlight = TRUE,
+  defaultSorted = "Documentos", defaultSortOrder = "desc",
+  defaultColDef = reactable::colDef(align = "center"),
+  theme = reactable::reactableTheme(headerStyle = list(fontWeight = "bold"))
+)
+
+reactable::reactable(
+  df_bert |>
+    transmute(doc_id, texto, cluster_bert, categoria_bert) |>
+    slice_head(n = 20) |>
+    as.data.frame(),
+  searchable = TRUE,
+  defaultPageSize = 10,
+  columns = list(
+    doc_id        = reactable::colDef(name = "Documento"),
+    texto         = reactable::colDef(name = "Texto", minWidth = 540),
+    cluster_bert  = reactable::colDef(name = "Cluster"),
+    categoria_bert= reactable::colDef(name = "Categoría")
+  ),
+  theme = reactable::reactableTheme(headerStyle = list(fontWeight = "bold"))
+)
+
+# 4.11 Guardados (forzar data.frame plano para evitar columnas lista/matriz)
+OUT <- "outputs"; dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+
+labels_df <- tibble(
+  cluster = sort(unique(clusters)),
+  categoria_asignada = CATS[assignments]
+) |> as.data.frame()
+
+readr::write_csv(labels_df, file.path(OUT, "bert_cluster_labels.csv"))
+readr::write_csv(as.data.frame(df_bert[, c("doc_id","texto","cluster_bert","categoria_bert")]),
+                 file.path(OUT, "documentos_bert_clusters.csv"))
+cat(">> Guardados:\n - outputs/bert_cluster_labels.csv\n - outputs/documentos_bert_clusters.csv\n")
+
+invisible(NULL)
+```
+
+### Conclusión (BERT)
+
+El modelo BERT (`hiiamsid/sentence_similarity_spanish_es`) ha generado embeddings consistentes de los 106 documentos.  
+Tras aplicar UMAP y clustering con KMeans (k=7), los documentos se agrupan de forma clara en siete clusters, que han podido asociarse automáticamente a las categorías predefinidas (Clima, Cocina, Deportes, Finanzas, Historia, Música y Tecnología).  
+
+El Silhouette obtenido (0.177) refleja que los clusters están razonablemente diferenciados, aunque con cierta superposición en los límites.  
+El reparto de documentos entre categorías es equilibrado, destacando **Tecnología (19 docs)** y **Musica (16 docs)** como las clases más representadas.
+
+# 5. Clustering con Qwen3 (Ollama)
+
+En este apartado utilizamos el modelo **Qwen3-Embedding-4B:Q4_K_M** ejecutado localmente mediante **Ollama**.  
+El flujo de trabajo es el siguiente:  
+
+1. Obtener los embeddings de cada documento a través de la API de Ollama.  
+2. Reducir la dimensionalidad de los embeddings con **UMAP** (paquete `uwot` en R).  
+3. Aplicar **KMeans (k=7)** para generar los clusters.  
+4. Asignar cada cluster a una de las categorías conocidas (Clima, Cocina, Deportes, Finanzas, Historia, Música, Tecnología) en función de la similitud entre centroides y embeddings de las etiquetas.  
+5. Visualizar los resultados mediante tablas interactivas (`reactable`) y un gráfico UMAP coloreado por categoría asignada.  
+
+Este procedimiento nos permitirá comparar posteriormente la clasificación de Qwen3 con los resultados obtenidos con **BERT** y **Gemini**.
+
+```{r qween_ollama_clustering, message=FALSE, warning=FALSE}
+# --- 5) Qwen3 (Ollama) → Embeddings (prompt) → UMAP → KMeans(k=7) → Asignación de categorías ---
+
+# Requisitos ya cargados previamente:
+# httr2, jsonlite, uwot, dplyr, ggplot2, reactable, readr, tibble, tidyr
+
+# 5.1 Parámetros y helpers ------------------------------------------------------
+OLLAMA_URL <- Sys.getenv("OLLAMA_URL", "http://localhost:11434")
+MODEL_ID   <- "dengcao/Qwen3-Embedding-4B:Q4_K_M"
+CATS       <- c("Clima","Cocina","Deportes","Finanzas","Historia","Música","Tecnología")
+SEED       <- 123
+
+# Normaliza filas a norma 1 (para coseno)
+row_norm <- function(M) {
+  M <- as.matrix(M)
+  nrm <- sqrt(rowSums(M * M)) + 1e-12
+  M / nrm
+}
+
+# Coseno: A %*% t(B) (asumiendo filas ya normalizadas)
+cosine_sim <- function(A, B) {
+  A %*% t(B)
+}
+
+# Envía un único 'prompt' al endpoint /api/embeddings y devuelve un vector numérico
+embed_one_prompt <- function(text) {
+  req <- httr2::request(paste0(OLLAMA_URL, "/api/embeddings")) |>
+    httr2::req_body_json(list(model = MODEL_ID, prompt = text), auto_unbox = TRUE)
+  resp <- httr2::req_perform(req)
+  js   <- httr2::resp_body_json(resp)
+  v    <- js$embedding
+  if (is.null(v) && !is.null(js$embeddings)) v <- js$embeddings[[1]]
+  v <- unlist(v, use.names = FALSE)
+  if (length(v) == 0) stop("Embedding vacío devuelto por Ollama (dim=0).")
+  as.numeric(v)
+}
+
+# 5.2 Embeddings para los documentos (prompt) ----------------------------------
+texts <- documentos$texto |> as.character()
+cat(">> Solicitando embeddings a Ollama (", MODEL_ID, ") usando 'prompt'...\n", sep="")
+
+emb_list <- vector("list", length(texts))
+for (i in seq_along(texts)) {
+  # Progreso ligero en consola
+  if (i %% 10 == 0 || i == length(texts)) cat(sprintf("   - doc %d / %d\n", i, length(texts)))
+  emb_list[[i]] <- embed_one_prompt(texts[i])
+}
+# RBind a matriz (n_docs x dim)
+emb_qwen <- do.call(rbind, emb_list)
+emb_qwen <- row_norm(emb_qwen)
+cat(">> Shape embeddings (Qwen): ", paste(dim(emb_qwen), collapse=" x "), "\n", sep="")
+
+# 5.3 UMAP (2D solo para visualización) ----------------------------------------
+set.seed(SEED)
+emb2_q <- uwot::umap(
+  emb_qwen,
+  n_neighbors = 15, min_dist = 0.1,
+  metric = "cosine",
+  n_components = 2, verbose = FALSE, ret_model = FALSE
+)
+
+# 5.4 Clustering KMeans (k=7) --------------------------------------------------
+set.seed(SEED)
+km_q <- stats::kmeans(emb_qwen, centers = 7, nstart = 20)
+clusters_q <- km_q$cluster
+
+# Silhouette (cosine): construimos distancia coseno (1 - coseno)
+# Para 106 docs es asumible calcular la matriz completa
+S <- cosine_sim(emb_qwen, emb_qwen)
+D <- 1 - S
+diag(D) <- 0
+sil_q <- mean(cluster::silhouette(clusters_q, as.dist(D))[, "sil_width"])
+cat(sprintf(">> KMeans k=7 · Silhouette (cosine): %.3f\n", sil_q))
+
+# 5.5 Asignación de categorías por similitud con centroides --------------------
+# Embeddings de las 7 categorías (mismo modelo y 'prompt')
+cat("\n>> Calculando embeddings de categorías...\n")
+cat_emb_list <- lapply(CATS, embed_one_prompt)
+cat_emb <- do.call(rbind, cat_emb_list)
+cat_emb <- row_norm(cat_emb)
+
+# Centroides (media por cluster)
+centros <- vapply(
+  sort(unique(clusters_q)),
+  function(c) colMeans(emb_qwen[clusters_q == c, , drop = FALSE]),
+  numeric(ncol(emb_qwen))
+)
+centros <- t(centros)              # (k x dim)
+centros <- row_norm(centros)
+
+# Similaridad (k x 7)
+SIM <- centros %*% t(cat_emb)
+
+# Asignación inyectiva (greedy): cada cluster se empareja a una única categoría
+assignments <- integer(nrow(SIM))
+used <- rep(FALSE, length(CATS))
+order_clusters <- order(apply(SIM, 1, max), decreasing = TRUE)
+for (ci in order_clusters) {
+  ord_cats <- order(SIM[ci, ], decreasing = TRUE)
+  pick <- which(!used)[match(ord_cats, which(!used))]
+  # 'pick' devuelve índices de CATS no usados en orden de preferencia
+  j <- ord_cats[which(!used[ord_cats])[1]]
+  if (is.na(j)) j <- ord_cats[1]  # fallback (no debería pasar con k=7 y 7 categorías)
+  assignments[ci] <- j
+  used[j] <- TRUE
+}
+
+cluster_to_cat <- setNames(CATS[assignments], paste0(sort(unique(clusters_q))))
+cat_map <- tibble::tibble(
+  cluster = sort(unique(clusters_q)),
+  categoria_asignada = CATS[assignments]
+)
+
+# 5.6 DataFrames de salida ------------------------------------------------------
+df_q <- documentos |>
+  dplyr::mutate(
+    cluster_qwen   = clusters_q,
+    categoria_qwen = cluster_to_cat[as.character(clusters_q)]
+  )
+
+# 5.7 Visualización -------------------------------------------------------------
+# UMAP coloreado por categoría asignada
+plot_df <- tibble::tibble(
+  x = emb2_q[,1], y = emb2_q[,2],
+  categoria = df_q$categoria_qwen
+)
+
+p <- ggplot(plot_df, aes(x = x, y = y, color = categoria)) +
+  geom_point(size = 2.4, alpha = 0.9) +
+  scale_color_brewer(palette = "Set2") +
+  labs(title = "UMAP de embeddings (Qwen3 via Ollama) — Categorías asignadas") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+print(p)
+
+# Conteos por categoría/cluster (reactable)
+tab_conteos <- df_q |>
+  dplyr::count(categoria_qwen, name = "n") |>
+  dplyr::arrange(desc(n))
+
+reactable::reactable(
+  tab_conteos,
+  searchable = TRUE, striped = TRUE, highlight = TRUE,
+  defaultSorted = "n", defaultSortOrder = "desc",
+  columns = list(
+    categoria_qwen = reactable::colDef(name = "Categoría"),
+    n              = reactable::colDef(name = "Nº documentos")
+  ),
+  theme = reactable::reactableTheme(headerStyle = list(fontWeight = 600))
+)
+
+# 5.8 Guardados ----------------------------------------------------------------
+OUT_DIR <- fs::path("outputs"); if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+readr::write_csv(cat_map, fs::path(OUT_DIR, "qwen_cluster_labels.csv"))
+readr::write_csv(df_q,   fs::path(OUT_DIR, "documentos_qwen_clusters.csv"))
+
+cat("\n>> Guardados:\n - outputs/qwen_cluster_labels.csv\n - outputs/documentos_qwen_clusters.csv\n")
+cat(">> Recuento por categoría asignada (Qwen):\n")
+print(tab_conteos)
+```
+
+### Conclusión Punto 5 — Qwen3 (Ollama)
+
+El modelo **Qwen3** vía Ollama ha generado embeddings de dimensión 2560 y, tras la reducción con UMAP y clustering KMeans (k=7), se observa una separación más difusa entre grupos respecto a BERT (Silhouette ≈ 0.087).  
+Las categorías asignadas se reparten de forma equilibrada entre las siete clases, con un ligero predominio en **Tecnología** y **Clima**.  
+
+En conjunto, el resultado confirma la capacidad del modelo para distinguir temas, aunque con menor cohesión interna que la observada con BERT.
+
+# 6. Clustering con Gemini utilizando el paquete `ellmer`
+
+En este apartado vamos a aplicar un análisis de *clustering* sobre los documentos de nuestro corpus.  
+El objetivo es descubrir agrupaciones naturales de textos en función de su contenido semántico, sin necesidad de etiquetas previas.
+
+La metodología será la siguiente:
+
+1. Generar las representaciones vectoriales (*embeddings*) de los textos utilizando el modelo **Gemini**.
+
+2. Aplicar algoritmos de *clustering* disponibles en el paquete `ellmer` para organizar los documentos en grupos homogéneos.
+
+3. Visualizar los resultados mediante técnicas de reducción de dimensionalidad (PCA o UMAP) para interpretar los clusters.
+
+4. Analizar los textos más representativos de cada cluster, con el fin de identificar los temas principales de cada grupo.
+
+
+De esta manera podremos observar cómo los modelos de lenguaje permiten estructurar grandes colecciones de textos en categorías semánticas de forma automática.
+
+```{r gemini_setup_claveAPI, message=FALSE, warning=FALSE, eval=FALSE}
+# --- Setup de clave API para Gemini (ellmer) ---
+
+# ⚠️ Nota para la corrección:
+# Para ejecutar esta sección es necesario definir una clave API de Google AI válida:
+#    Sys.setenv(GOOGLE_API_KEY = "TU_API_KEY_AQUI")
+# o bien guardarla en el archivo .Renviron:
+#    GOOGLE_API_KEY=TU_API_KEY_AQUI
+#
+# Sin esta clave la parte de Gemini no podrá ejecutarse,
+# pero el flujo de trabajo y el código están preparados.
+
+if (Sys.getenv("GOOGLE_API_KEY") == "") {
+  stop("No se ha definido la variable GOOGLE_API_KEY. 
+        Por favor, configure su propia clave de Gemini antes de continuar.")
+} else {
+  cat(">> Clave API detectada. Listo para usar Gemini con ellmer.\n")
+}
+```
+
+
+
+```{r gemini_embeddings_umap_kmeans, message=FALSE, warning=FALSE, eval=FALSE}
+# --- 6-bis) Gemini: reasignación robusta de categorías (prototipos + algoritmo Húngaro) ---
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tibble); library(httr2)
+})
+
+# 0) Comprobaciones
+stopifnot(exists("documentos"), all(c("doc_id","texto") %in% names(documentos)))
+api_key <- Sys.getenv("GOOGLE_API_KEY", "")
+if (api_key == "") stop("No hay GOOGLE_API_KEY definida. Configura tu clave antes de ejecutar este bloque.")
+
+# Instalar 'clue' si falta (para solve_LSAP / algoritmo Húngaro)
+if (!requireNamespace("clue", quietly = TRUE)) install.packages("clue")
+
+# --- Función para un embedding con Gemini (content-only, con reintentos) ---
+gemini_embed_one <- function(txt, model = "models/text-embedding-004", key = api_key,
+                             task_type = "RETRIEVAL_QUERY",
+                             max_retries = 5, base_wait = 1) {
+  url <- "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent"
+  req <- request(url) |>
+    req_url_query(key = key) |>
+    req_body_json(
+      list(
+        content = list(parts = list(list(text = txt))),
+        taskType = task_type
+      ),
+      auto_unbox = TRUE
+    ) |>
+    req_method("POST") |>
+    req_timeout(30)
+
+  for (i in 0:max_retries) {
+    resp <- try(req_perform(req), silent = TRUE)
+    if (!inherits(resp, "try-error") && httr2::resp_status(resp) == 200) {
+      js <- resp_body_json(resp)
+      vals <- js$embedding$values
+      if (is.null(vals)) stop("Respuesta sin 'embedding.values'.")
+      return(unlist(vals, use.names = FALSE))
+    }
+    if (i < max_retries) Sys.sleep(base_wait * (2^i))
+  }
+  stop("Fallo persistente obteniendo embedding.")
+}
+
+# --- Embeddings de documentos (reutiliza si ya existen) ---
+need_docs <- (!exists("emb_norm")) || (nrow(emb_norm) != nrow(documentos))
+if (need_docs) {
+  cat(">> (Re)solicitando embeddings a Gemini para documentos…\n")
+  texts <- as.character(documentos$texto)
+  emb_list <- vector("list", length(texts))
+  for (i in seq_along(texts)) {
+    if (i %% 10 == 0 || i == length(texts)) cat(sprintf("  - doc %d / %d\n", i, length(texts)))
+    emb_list[[i]] <- tryCatch(gemini_embed_one(texts[[i]], task_type = "RETRIEVAL_DOCUMENT"), error = function(e) NULL)
+    Sys.sleep(0.15)
+  }
+  ok <- which(!vapply(emb_list, is.null, logical(1)))
+  if (length(ok) != length(texts)) stop("No pude obtener embedding para ", length(texts) - length(ok), " textos.")
+  emb_mat <- do.call(rbind, emb_list)
+  # Normaliza
+  emb_norm <<- emb_mat / (sqrt(rowSums(emb_mat^2)) + 1e-12)
+} else {
+  cat(">> Reutilizando 'emb_norm' existente.\n")
+}
+
+# --- UMAP 2D (si no existe) ---
+if (!exists("emb_2d") || nrow(emb_2d) != nrow(emb_norm)) {
+  set.seed(123)
+  emb_2d <<- uwot::umap(emb_norm, n_neighbors = 15, min_dist = 0.1, metric = "cosine", n_components = 2)
+  colnames(emb_2d) <<- c("x","y")
+  cat(">> UMAP calculado.\n")
+} else {
+  cat(">> Reutilizando 'emb_2d' existente.\n")
+}
+
+# --- KMeans k=7 (si no existe) ---
+if (!exists("clusters") || length(clusters) != nrow(emb_norm)) {
+  set.seed(123)
+  k <- 7
+  km <- stats::kmeans(emb_norm, centers = k, nstart = 20)
+  clusters <<- km$cluster
+  cat(">> KMeans recalculado (k=7).\n")
+} else {
+  k <- length(unique(clusters))
+  cat(">> Reutilizando clusters existentes (k=", k, ").\n", sep = "")
+}
+
+# --- Silhouette (coseno) ---
+cos_sim <- emb_norm %*% t(emb_norm)
+cos_dist <- 1 - cos_sim
+sil <- cluster::silhouette(clusters, as.dist(cos_dist))
+sil_avg <- mean(sil[, "sil_width"])
+cat(sprintf(">> Silhouette (cosine): %.3f\n", sil_avg))
+
+# --- Prototipos multi-frase por categoría ---
+protos <- list(
+  Clima = c(
+    "El texto trata sobre clima, tiempo atmosférico, temperaturas, lluvias, viento y meteorología.",
+    "Describe fenómenos como tormentas, granizo, nieve, humedad y pronósticos del tiempo."
+  ),
+  Cocina = c(
+    "El texto trata de cocina: recetas, ingredientes, preparar platos, horno y técnicas culinarias.",
+    "Se mencionan sabores, cocinar, freír, cortar, mezclar y servir comida."
+  ),
+  Deportes = c(
+    "El texto trata de deportes: partidos, equipos, goles, competiciones y entrenamientos.",
+    "Se habla de jugadores, ligas, torneos, marcadores y victorias."
+  ),
+  Finanzas = c(
+    "El texto trata de finanzas: economía, inversión, mercados, bolsa, acciones y bancos.",
+    "Se mencionan tasas de interés, presupuestos, inflación y rentabilidad."
+  ),
+  Historia = c(
+    "El texto trata de historia: reyes, imperios, guerras, épocas y siglos pasados.",
+    "Se mencionan periodos históricos, revoluciones, acontecimientos y cronologías."
+  ),
+  Música = c(
+    "El texto trata de música: canciones, conciertos, melodías, ritmos e instrumentos.",
+    "Se habla de cantantes, bandas, álbumes, ensayos y grabaciones."
+  ),
+  Tecnología = c(
+    "El texto trata de tecnología: software, hardware, internet y dispositivos electrónicos.",
+    "Se mencionan algoritmos, inteligencia artificial, datos y sistemas informáticos."
+  )
+)
+categorias <- names(protos)
+
+# --- Embeddings de prototipos y centroide por categoría ---
+cat(">> Obteniendo embeddings de prototipos por categoría…\n")
+cat_vecs <- lapply(protos, function(frases) {
+  vv <- lapply(frases, function(s) gemini_embed_one(s, task_type = "RETRIEVAL_QUERY"))
+  M <- do.call(rbind, vv)
+  M / (sqrt(rowSums(M^2)) + 1e-12)
+})
+# Centroide (promedio) por categoría
+cat_centroids <- t(vapply(cat_vecs, function(M) colMeans(M), numeric(ncol(emb_norm))))
+cat_centroids <- cat_centroids / (sqrt(rowSums(cat_centroids^2)) + 1e-12) # normaliza
+
+# --- Centroide por cluster ---
+cl_centroids <- vapply(split.data.frame(emb_norm, clusters), function(M) colMeans(as.matrix(M)), numeric(ncol(emb_norm)))
+cl_centroids <- t(cl_centroids)
+cl_centroids <- cl_centroids / (sqrt(rowSums(cl_centroids^2)) + 1e-12)
+
+# --- Matriz de similitud y asignación óptima (Hungarian) ---
+sim <- cl_centroids %*% t(cat_centroids)    # k x 7 (coseno)
+# solve_LSAP minimiza coste → usamos coste = 1 - sim (maximizar sim)
+cost <- 1 - sim
+assign <- clue::solve_LSAP(cost)            # devuelve índices de categoría para cada cluster (1..7)
+cluster_to_cat <- categorias[as.integer(assign)]
+
+# --- DataFrame final con categoría asignada ---
+df_gemini <- documentos |>
+  mutate(
+    cluster_gem = clusters,
+    categoria_gem = cluster_to_cat[clusters]
+  )
+
+# --- UMAP coloreado por categoría ---
+plt <- ggplot(
+  df_gemini |> mutate(x = emb_2d[,1], y = emb_2d[,2]),
+  aes(x, y, color = categoria_gem)
+) +
+  geom_point(alpha = 0.9, size = 2.2) +
+  labs(title = "UMAP de embeddings (Gemini) — categoría por asignación óptima",
+       color = "Categoría") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+print(plt)
+
+# --- Recuentos por categoría (reactable) ---
+tab_counts <- df_gemini |>
+  count(categoria_gem, name = "Documentos") |>
+  arrange(desc(Documentos)) |>
+  rename(Categoría = categoria_gem)
+
+reactable::reactable(
+  tab_counts,
+  searchable = TRUE, striped = TRUE, highlight = TRUE,
+  defaultPageSize = 7,
+  defaultColDef = reactable::colDef(align = "center"),
+  theme = reactable::reactableTheme(headerStyle = list(fontWeight = "bold"))
+)
+
+# --- 20 ejemplos (reactable) ---
+reactable::reactable(
+  df_gemini |>
+    transmute(doc_id, texto, cluster_gem, categoria_gem) |>
+    slice_head(n = 20),
+  searchable = TRUE,
+  defaultPageSize = 10,
+  columns = list(
+    doc_id = reactable::colDef(name = "Documento"),
+    texto  = reactable::colDef(name = "Texto", minWidth = 540),
+    cluster_gem = reactable::colDef(name = "Cluster"),
+    categoria_gem = reactable::colDef(name = "Categoría")
+  ),
+  theme = reactable::reactableTheme(headerStyle = list(fontWeight = "bold"))
+)
+
+# --- Guardados ---
+OUT <- file.path(getwd(), "outputs")
+dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+write_csv(
+  tibble(cluster = seq_len(k), categoria_asignada = cluster_to_cat),
+  file.path(OUT, "gemini_cluster_labels.csv")
+)
+write_csv(df_gemini, file.path(OUT, "documentos_gemini_clusters.csv"))
+cat(">> Guardados:\n - outputs/gemini_cluster_labels.csv\n - outputs/documentos_gemini_clusters.csv\n")
+# hace clustering, calcula UMAP y arma df_gemini ...
+
+# --- Guardados (para no depender de Gemini en el knit) ---
+saveRDS(emb_2d, "outputs/gemini_emb_2d.rds")
+readr::write_csv(df_gemini, "outputs/documentos_gemini_clusters.csv")
+```
+
+```{r gemini_cargar_resultados, message=FALSE, warning=FALSE, results='asis'}
+suppressPackageStartupMessages({
+  library(dplyr); library(readr); library(reactable); library(ggplot2)
+})
+
+OUT <- file.path(getwd(), "outputs")
+df_path   <- file.path(OUT, "documentos_gemini_clusters.csv")
+umap_rds  <- file.path(OUT, "gemini_emb_2d.rds")
+
+if (!file.exists(df_path)) {
+  stop("No encuentro 'outputs/documentos_gemini_clusters.csv'. Ejecuta una vez el chunk pesado (eval=TRUE) para generarlo.")
+}
+
+# 1) Cargar resultados de Gemini
+df_gemini <- readr::read_csv(df_path, show_col_types = FALSE)
+
+# 2) Recuento por categoría
+tab_counts <- df_gemini %>%
+  count(categoria_gem, name = "Documentos") %>%
+  arrange(desc(Documentos)) %>%
+  rename(Categoría = categoria_gem)
+
+cat("### Recuento de documentos por categoría (Gemini)\n")
+reactable::reactable(
+  tab_counts,
+  striped = TRUE, highlight = TRUE,
+  defaultPageSize = 7,
+  defaultColDef = reactable::colDef(align = "center"),
+  theme = reactable::reactableTheme(headerStyle = list(fontWeight = "bold"))
+)
+
+# 3) Muestra de 20 ejemplos
+cat("### 20 ejemplos (doc_id, texto, cluster, categoría)\n")
+reactable::reactable(
+  df_gemini %>%
+    transmute(doc_id, texto, cluster_gem, categoria_gem) %>%
+    slice_head(n = 20),
+  searchable = TRUE,
+  defaultPageSize = 10,
+  columns = list(
+    doc_id       = reactable::colDef(name = "Documento"),
+    texto        = reactable::colDef(name = "Texto", minWidth = 540),
+    cluster_gem  = reactable::colDef(name = "Cluster"),
+    categoria_gem= reactable::colDef(name = "Categoría")
+  ),
+  theme = reactable::reactableTheme(headerStyle = list(fontWeight = "bold"))
+)
+
+# 4) UMAP (si existe el RDS)
+if (file.exists(umap_rds)) {
+  emb_2d <- readRDS(umap_rds)
+  if (nrow(emb_2d) == nrow(df_gemini)) {
+    df_plot <- df_gemini %>%
+      mutate(x = emb_2d[,1], y = emb_2d[,2])
+
+    p <- ggplot(df_plot, aes(x, y, color = categoria_gem)) +
+      geom_point(alpha = 0.85, size = 2) +
+      labs(title = "UMAP de embeddings (Gemini) — coloreado por categoría asignada",
+           color = "Categoría") +
+      theme_minimal(base_size = 12) +
+      theme(legend.position = "right")
+    print(p)
+  } else {
+    cat("**Aviso:** El UMAP guardado no coincide en filas con el CSV actual; omito el gráfico.\n")
+  }
+} else {
+  cat("**Aviso:** No se encontró 'outputs/gemini_emb_2d.rds'. El UMAP se omite en el knit.\n")
+}
+```
+
+
+### Conclusión — Gemini
+
+El modelo **Gemini (text-embedding-004)** ha conseguido separar los documentos en 7 grupos bien definidos, con una puntuación de **Silhouette = 0.230**, la mejor entre los métodos aplicados.  
+La asignación de categorías mediante prototipos resultó coherente con la temática de los textos y el reparto de documentos quedó equilibrado (15–16 por categoría).  
+
+En comparación con BERT y Qwen, Gemini ofrece una mayor capacidad de discriminación semántica, mostrando clusters más compactos y separados en el espacio reducido por UMAP.
+
+# 7. Comparativa final de modelos LLM (BERT · Qwen3 · Gemini)
+
+En este apartado integramos los resultados obtenidos con los tres enfoques de embeddings y clustering, comparando su calidad (Silhouette), la distribución de documentos por categoría y ejemplos de asignación, con el fin de evaluar fortalezas y debilidades de cada modelo.
+
+```{r comparativa, message=FALSE, warning=FALSE}
+# --- 7) Comparativa final (BERT vs Qwen vs Gemini) desde CSV guardados (versión robusta) ---
+
+
+# Helper para elegir la primera columna existente de un vector de posibles nombres
+pick_col <- function(df, candidates) {
+  hit <- intersect(candidates, names(df))
+  if (length(hit) == 0) return(NULL)
+  df[[hit[1]]]
+}
+
+# 1) Cargar CSVs (ajusta rutas si fuese necesario)
+path_bert   <- "outputs/documentos_bert_clusters.csv"
+path_qwen   <- "outputs/documentos_qwen_clusters.csv"
+path_gemini <- "outputs/documentos_gemini_clusters.csv"
+
+stopifnot(file.exists(path_bert), file.exists(path_qwen), file.exists(path_gemini))
+
+bert   <- read_csv(path_bert,   show_col_types = FALSE)
+qwen   <- read_csv(path_qwen,   show_col_types = FALSE)
+gemini <- read_csv(path_gemini, show_col_types = FALSE)
+
+# 2) Armonizar data frames a un esquema común: doc_id, texto, categoría
+norm_df <- function(df, method) {
+  tibble(
+    doc_id = pick_col(df, c("doc_id","id","docID")),
+    texto  = pick_col(df, c("texto","text","summary")),
+    categoria = dplyr::coalesce(
+      pick_col(df, c("categoria_bert","categoria_qwen","categoria_gem","categoria_gemini","categoria")),
+      NA_character_
+    ),
+    metodo = method
+  )
+}
+
+bert_n   <- norm_df(bert,   "BERT")
+qwen_n   <- norm_df(qwen,   "Qwen3")
+gemini_n <- norm_df(gemini, "Gemini")
+
+# 3) Unir por doc_id
+comp <- bert_n %>%
+  select(doc_id, texto, cat_bert = categoria) %>%
+  full_join(select(qwen_n,   doc_id, cat_qwen = categoria),   by = "doc_id") %>%
+  full_join(select(gemini_n, doc_id, cat_gemini = categoria), by = "doc_id") %>%
+  # ordenar por el número en doc_id si existe (doc_1, doc_2, …)
+  mutate(doc_num = suppressWarnings(as.integer(str_extract(doc_id, "\\d+")))) %>%
+  arrange(doc_num) %>%
+  select(-doc_num)
+
+# 4) Tabla comparativa principal
+reactable(
+  comp,
+  searchable = TRUE, striped = TRUE, highlight = TRUE, pagination = TRUE,
+  defaultPageSize = 15,
+  columns = list(
+    doc_id     = colDef(name = "Documento", width = 100),
+    texto      = colDef(name = "Texto", minWidth = 520),
+    cat_bert   = colDef(name = "BERT"),
+    cat_qwen   = colDef(name = "Qwen3"),
+    cat_gemini = colDef(name = "Gemini")
+  ),
+  theme = reactableTheme(headerStyle = list(fontWeight = 700))
+)
+
+# 5) Discrepancias: Gemini vs BERT y Gemini vs Qwen3
+no_match_gem_bert <- comp %>% filter(!is.na(cat_gemini), !is.na(cat_bert),  cat_gemini != cat_bert)
+no_match_gem_qwen <- comp %>% filter(!is.na(cat_gemini), !is.na(cat_qwen),  cat_gemini != cat_qwen)
+
+if (nrow(no_match_gem_bert)) {
+  cat("\n**No coinciden (Gemini ≠ BERT)**\n")
+  print(reactable(
+    no_match_gem_bert %>% select(doc_id, texto, BERT = cat_bert, Gemini = cat_gemini),
+    searchable = TRUE, defaultPageSize = 10,
+    columns = list(texto = colDef(minWidth = 520))
+  ))
+}
+
+if (nrow(no_match_gem_qwen)) {
+  cat("\n**No coinciden (Gemini ≠ Qwen3)**\n")
+  print(reactable(
+    no_match_gem_qwen %>% select(doc_id, texto, Qwen3 = cat_qwen, Gemini = cat_gemini),
+    searchable = TRUE, defaultPageSize = 10,
+    columns = list(texto = colDef(minWidth = 520))
+  ))
+}
+
+# 6) Recuento por método y categoría
+counts <- bind_rows(
+  bert_n   %>% count(categoria, name = "n") %>% mutate(metodo = "BERT"),
+  qwen_n   %>% count(categoria, name = "n") %>% mutate(metodo = "Qwen3"),
+  gemini_n %>% count(categoria, name = "n") %>% mutate(metodo = "Gemini")
+) %>%
+  mutate(categoria = tidyr::replace_na(categoria, "(NA)")) %>%
+  pivot_wider(names_from = metodo, values_from = n, values_fill = 0) %>%
+  arrange(categoria) %>%
+  rename(Categoría = categoria)
+
+cat("\n**Recuento de documentos por categoría y método**\n")
+reactable(
+  counts,
+  defaultPageSize = 10, searchable = TRUE, striped = TRUE,
+  theme = reactableTheme(headerStyle = list(fontWeight = 700))
+)
+```
+
+```{r comparativa metricas, message=FALSE, warning=FALSE}
+# --- 7) Comparativa entre BERT, Qwen3 y Gemini (desde CSV) con títulos integrados ---
+
+instalar_si_falta("mclust")
+instalar_si_falta("aricode")
+instalar_si_falta("reactable")
+instalar_si_falta("htmltools")
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(purrr)
+  library(reactable); library(mclust); library(aricode); library(htmltools)
+})
+
+# Helper para poner título encima de cada reactable
+rt_with_title <- function(tbl, title, ...) {
+  tagList(
+    htmltools::h4(title, style = "margin: 0 0 8px 0; font-weight: 700;"),
+    reactable::reactable(tbl, ...)
+  )
+}
+
+# Helper: elige el primer nombre que exista
+pick_name <- function(nms, candidates, label="") {
+  cn <- intersect(candidates, nms)
+  if (length(cn) == 0) {
+    stop(sprintf("No encuentro columna para %s. Candidatas: %s\nNombres presentes: %s",
+                 label, paste(candidates, collapse=", "), paste(nms, collapse=", ")))
+  }
+  cn[1]
+}
+
+# 1) Cargar resultados
+bert_raw <- read_csv("outputs/documentos_bert_clusters.csv", show_col_types = FALSE)
+qwen_raw <- read_csv("outputs/documentos_qwen_clusters.csv", show_col_types = FALSE)
+gem_raw  <- read_csv("outputs/documentos_gemini_clusters.csv", show_col_types = FALSE)
+
+# 2) Normalizar nombres a un esquema común
+# BERT
+doc_id_col_b  <- pick_name(names(bert_raw), c("doc_id","Documento","id"), "doc_id (BERT)")
+texto_col_b   <- pick_name(names(bert_raw), c("texto","Texto","text"), "texto (BERT)")
+cat_col_b     <- pick_name(names(bert_raw), c("categoria_bert","categoria","categoria_asignada"), "categoría (BERT)")
+bert <- bert_raw %>%
+  transmute(doc_id = .data[[doc_id_col_b]],
+            texto  = .data[[texto_col_b]],
+            categoria_bert = .data[[cat_col_b]])
+
+# Qwen3
+doc_id_col_q  <- pick_name(names(qwen_raw), c("doc_id","Documento","id"), "doc_id (Qwen)")
+cat_col_q     <- pick_name(names(qwen_raw), c("categoria_qwen","categoria","categoria_asignada"), "categoría (Qwen)")
+qwen <- qwen_raw %>%
+  transmute(doc_id = .data[[doc_id_col_q]],
+            categoria_qwen = .data[[cat_col_q]])
+
+# Gemini
+doc_id_col_g  <- pick_name(names(gem_raw), c("doc_id","Documento","id"), "doc_id (Gemini)")
+cat_col_g     <- pick_name(names(gem_raw), c("categoria_gem","categoria","categoria_asignada"), "categoría (Gemini)")
+gem <- gem_raw %>%
+  transmute(doc_id = .data[[doc_id_col_g]],
+            categoria_gem = .data[[cat_col_g]])
+
+# Unión
+df <- bert %>% inner_join(qwen, by="doc_id") %>% inner_join(gem, by="doc_id")
+
+# 3) Tasas de acuerdo (%) par a par
+pct <- function(x) scales::percent(x, accuracy = 0.1)
+agr_bq <- mean(df$categoria_bert == df$categoria_qwen)
+agr_bg <- mean(df$categoria_bert == df$categoria_gem)
+agr_qg <- mean(df$categoria_qwen == df$categoria_gem)
+tasas <- tibble(
+  Comparación = c("BERT vs Qwen3","BERT vs Gemini","Qwen3 vs Gemini"),
+  `Acuerdo (%)` = pct(c(agr_bq, agr_bg, agr_qg))
+)
+
+# 4) ARI y NMI
+asf <- function(x) as.factor(x)
+ari_bq <- adjustedRandIndex(asf(df$categoria_bert), asf(df$categoria_qwen))
+ari_bg <- adjustedRandIndex(asf(df$categoria_bert), asf(df$categoria_gem))
+ari_qg <- adjustedRandIndex(asf(df$categoria_qwen), asf(df$categoria_gem))
+
+nmi_bq <- NMI(df$categoria_bert, df$categoria_qwen)
+nmi_bg <- NMI(df$categoria_bert, df$categoria_gem)
+nmi_qg <- NMI(df$categoria_qwen, df$categoria_gem)
+
+indices <- tibble(
+  Comparación = c("BERT vs Qwen3","BERT vs Gemini","Qwen3 vs Gemini"),
+  `ARI` = round(c(ari_bq, ari_bg, ari_qg), 3),
+  `NMI` = round(c(nmi_bq, nmi_bg, nmi_qg), 3)
+)
+
+# 5) Matrices de confusión (BERT como referencia)
+conf_bq <- df %>% count(Ref = categoria_bert, Qwen3 = categoria_qwen) %>% arrange(Ref, desc(n))
+conf_bg <- df %>% count(Ref = categoria_bert, Gemini = categoria_gem)  %>% arrange(Ref, desc(n))
+
+# 6) Acuerdo por categoría (acierto de Qwen/Gemini dentro de cada clase de referencia BERT)
+acuerdo_por_cat <- df %>%
+  mutate(OK_qwen = categoria_qwen == categoria_bert,
+         OK_gem  = categoria_gem  == categoria_bert) %>%
+  group_by(categoria_bert) %>%
+  summarise(
+    Docs = n(),
+    `Qwen3 (acierto vs BERT)`  = pct(mean(OK_qwen)),
+    `Gemini (acierto vs BERT)` = pct(mean(OK_gem)),
+    .groups = "drop"
+  ) %>%
+  rename(Categoría = categoria_bert)
+
+# 7) “Quién falla más” vs consenso (voto mayoritario con tie-break a BERT)
+mayoria <- df %>%
+  mutate(
+    voto = pmap_chr(list(categoria_bert, categoria_qwen, categoria_gem), function(a,b,c){
+      tab <- sort(table(c(a,b,c)), decreasing = TRUE)
+      # si hay empate 1-1-1, desempatamos con BERT
+      if (length(tab) == 3 && tab[1] == 1) return(a)
+      names(tab)[1]
+    }),
+    fallo_bert = categoria_bert != voto,
+    fallo_qwen = categoria_qwen != voto,
+    fallo_gem  = categoria_gem  != voto
+  )
+
+quien_falla_mas <- tibble(
+  Modelo = c("BERT","Qwen3","Gemini"),
+  Fallos = c(sum(mayoria$fallo_bert), sum(mayoria$fallo_qwen), sum(mayoria$fallo_gem))
+) %>%
+  mutate(`% Fallos` = pct(Fallos / nrow(df)))
+
+# 8) Tablas interactivas (con títulos integrados)
+rt_with_title(
+  tasas,
+  title = "Tabla de acuerdos porcentuales entre modelos",
+  theme = reactableTheme(headerStyle = list(fontWeight = "bold")),
+  columns = list(Comparación = colDef(minWidth = 160))
+)
+
+rt_with_title(
+  indices,
+  title = "Tabla de índices ARI y NMI (medidas de similitud entre clusters)",
+  theme = reactableTheme(headerStyle = list(fontWeight = "bold")),
+  columns = list(Comparación = colDef(minWidth = 160))
+)
+
+rt_with_title(
+  conf_bq,
+  title = "Correspondencia entre categorías de referencia (BERT) y las predicciones de Qwen3",
+  groupBy = "Ref",
+  searchable = TRUE,
+  theme = reactableTheme(headerStyle = list(fontWeight = "bold")),
+  columns = list(Ref = colDef(name="Ref (BERT)"), Qwen3 = colDef(name="Qwen3"))
+)
+
+rt_with_title(
+  conf_bg,
+  title = "Correspondencia entre categorías de referencia (BERT) y las predicciones de Gemini",
+  groupBy = "Ref",
+  searchable = TRUE,
+  theme = reactableTheme(headerStyle = list(fontWeight = "bold")),
+  columns = list(Ref = colDef(name="Ref (BERT)"), Gemini = colDef(name="Gemini"))
+)
+
+rt_with_title(
+  acuerdo_por_cat,
+  title = "Exactitud por categoría frente a la referencia (BERT)",
+  searchable = TRUE,
+  theme = reactableTheme(headerStyle = list(fontWeight = "bold"))
+)
+
+rt_with_title(
+  quien_falla_mas,
+  title = "Número de errores totales por modelo",
+  defaultSorted = "Fallos", defaultSortOrder = "desc",
+  theme = reactableTheme(headerStyle = list(fontWeight = "bold"))
+)
+
+# 9) Guardados
+OUT <- "outputs"; dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+write_csv(tasas, file.path(OUT,"tasas_acuerdo.csv"))
+write_csv(indices, file.path(OUT,"indices_similitud.csv"))
+write_csv(conf_bq, file.path(OUT,"confusion_BERT_vs_Qwen3.csv"))
+write_csv(conf_bg, file.path(OUT,"confusion_BERT_vs_Gemini.csv"))
+write_csv(acuerdo_por_cat, file.path(OUT,"acuerdo_por_categoria.csv"))
+write_csv(quien_falla_mas, file.path(OUT,"fallos_vs_consenso.csv"))
+```
+
+## Conclusión general
+
+Tras aplicar clustering con **tres enfoques distintos (BERT, Qwen3 y Gemini)** sobre el mismo conjunto de documentos, los resultados muestran lo siguiente:
+
+- **Coincidencia global**:  
+  - El mayor acuerdo se da entre **Qwen3 y Gemini (96,2%)**, lo que confirma una gran similitud en la asignación de categorías.  
+  - **BERT mantiene también una alta concordancia**: 96,2% frente a Qwen3 y 94,3% frente a Gemini, aunque con ligeras divergencias en categorías concretas.  
+
+- **Índices de calidad (ARI y NMI)**:  
+  - Los valores de **ARI (0,912) y NMI (0,933–0,934)** destacan la fuerte similitud estructural entre Qwen3 y Gemini.  
+  - BERT obtiene también valores altos (ARI ≈ 0,87; NMI ≈ 0,91), aunque algo por debajo.  
+
+- **Por categorías**:  
+  - Tanto Qwen3 como Gemini logran un 100% de acierto en *Clima, Cocina e Historia*.  
+  - En *Música* ambos modelos alcanzan una exactitud muy alta, aunque Gemini baja ligeramente (93,8%).  
+  - Las principales diferencias aparecen en *Tecnología* (Qwen3 84,2%, Gemini 78,9%), donde los tres modelos tienden a confundir algunos documentos.  
+  - En *Finanzas*, Gemini ofrece un 100% frente al 92,3% de Qwen3.  
+
+- **Errores totales**:  
+  - **Qwen3** es el modelo con menos errores (0,9%).  
+  - **BERT y Gemini** presentan cifras muy similares, ambos con un 2,8% de clasificaciones discordantes.  
+
+En conjunto, los resultados reflejan que **los tres modelos son consistentes y robustos**, con una concordancia muy elevada. No obstante:  
+- **Qwen3** se posiciona como el modelo más fiable en términos de menor tasa de error.  
+- **Gemini** destaca en categorías como *Finanzas* y mantiene un rendimiento homogéneo.  
+- **BERT**, aunque algo menos preciso en *Tecnología*, aporta estabilidad y sirve como buena referencia.  
+
+Estos hallazgos sugieren que, para aplicaciones prácticas, **la combinación de modelos (ensemble o validación cruzada entre ellos)** podría reforzar aún más la robustez de la clasificación en escenarios de auditoría documental.
